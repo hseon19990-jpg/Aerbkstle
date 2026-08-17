@@ -6,7 +6,7 @@ from pyrogram import Client, filters
 from pyrogram.types import ReplyKeyboardMarkup, KeyboardButton, Message
 from pyrogram.errors import SessionPasswordNeeded, PhoneCodeInvalid, PhoneCodeExpired
 
-# --- الإعدادات الأساسية (من المتغيرات البيئية) ---
+# --- الإعدادات الأساسية (تقرأ من المتغيرات البيئية) ---
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 OWNER_ID = int(os.environ.get("OWNER_ID", 0))
 API_ID = int(os.environ.get("API_ID", 0))
@@ -15,7 +15,7 @@ API_HASH = os.environ.get("API_HASH")
 DATA_FILE = "bot_data.json"
 login_sessions = {}
 
-# --- إدارة قاعدة البيانات ---
+# --- باقي الكود كما هو ---
 def load_data():
     if not os.path.exists(DATA_FILE):
         default_data = {
@@ -39,10 +39,8 @@ def save_data(data):
 
 db = load_data()
 
-# --- إنشاء البوت ---
 app = Client("auto_post_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# --- لوحة التحكم ---
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
         [KeyboardButton("➕ إضافة حساب"), KeyboardButton("➖ حذف حساب")],
@@ -55,7 +53,6 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
-# --- حلقة النشر التلقائي ---
 async def auto_posting_loop():
     global db
     while db["is_running"]:
@@ -101,7 +98,6 @@ async def auto_posting_loop():
         save_data(db)
         await asyncio.sleep(db.get("timer", 60))
 
-# --- أمر /start ---
 @app.on_message(filters.command("start") & filters.user(OWNER_ID))
 async def start_cmd(client: Client, message: Message):
     db["user_state"].pop(str(OWNER_ID), None)
@@ -117,14 +113,12 @@ async def start_cmd(client: Client, message: Message):
         reply_markup=MAIN_KEYBOARD
     )
 
-# --- معالج الرسائل والأوامر ---
 @app.on_message(filters.user(OWNER_ID) & filters.text)
 async def handle_menu(client: Client, message: Message):
     text = message.text
     user_id_str = str(OWNER_ID)
     state = db["user_state"].get(user_id_str)
 
-    # 1. مرحلة إدخال رقم الهاتف
     if state == "WAITING_PHONE":
         phone = text.strip()
         session_name = f"temp_session_{OWNER_ID}"
@@ -147,7 +141,6 @@ async def handle_menu(client: Client, message: Message):
                 os.remove(f"{session_name}.session")
             return await message.reply_text(f"❌ حدث خطأ أثناء إرسال الكود:\n`{e}`\nيرجى إعادة المحاولة مع مفتاح الدولة (مثال: +91... أو +964...).")
 
-    # 2. مرحلة إدخال رمز التحقق OTP
     elif state == "WAITING_OTP":
         otp = text.strip()
         session_info = login_sessions.get(OWNER_ID)
@@ -186,7 +179,6 @@ async def handle_menu(client: Client, message: Message):
             save_data(db)
             return await message.reply_text(f"❌ خطأ: `{e}`")
 
-    # 3. مرحلة إدخال كلمة المرور (2FA)
     elif state == "WAITING_PASSWORD":
         password = text.strip()
         session_info = login_sessions.get(OWNER_ID)
@@ -213,21 +205,18 @@ async def handle_menu(client: Client, message: Message):
         except Exception as e:
             return await message.reply_text(f"❌ كلمة المرور غير صحيحة. حاول مرة أخرى:\n`{e}`")
 
-    # إضافة كليشة
     elif state == "WAITING_TEMPLATE":
         db["templates"].append(text)
         db["user_state"].pop(user_id_str, None)
         save_data(db)
         return await message.reply_text("✅ تم إضافة الكليشة بنجاح.")
 
-    # إضافة كروب
     elif state == "WAITING_GROUP":
         db["groups"].append(text.strip())
         db["user_state"].pop(user_id_str, None)
         save_data(db)
         return await message.reply_text("✅ تم إضافة الكروب بنجاح.")
 
-    # تغيير المؤقت
     elif state == "WAITING_TIMER":
         if text.isdigit():
             db["timer"] = int(text)
@@ -237,7 +226,6 @@ async def handle_menu(client: Client, message: Message):
         else:
             return await message.reply_text("❌ يرجى إرسال رقم صحيح بالثواني.")
 
-    # --- القوائم الرئيسية ---
     if text == "➕ إضافة حساب":
         db["user_state"][user_id_str] = "WAITING_PHONE"
         save_data(db)
