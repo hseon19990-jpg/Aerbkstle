@@ -270,9 +270,9 @@ async def track_group_messages(client: Client, message: Message):
         save_data(db)
 
 # --- /start command ---
-@app.on_message(filters.text, group=-1)
+@app.on_message(group=-1)
 async def start_cmd(client: Client, message: Message):
-    raw_text = (message.text or "").strip()
+    raw_text = (message.text or message.caption or "").strip()
     command = raw_text.split(maxsplit=1)[0].split("@", 1)[0].lower()
     if command != "/start":
         return
