@@ -35,6 +35,8 @@ if missing_settings:
 # --- Data file ---
 DATA_FILE = "/app/data/bot_data.json"
 login_sessions = {}
+# Cache for account info to avoid repeated connections
+account_cache = {}
 
 # --- Load/Save Data ---
 def load_data():
@@ -143,6 +145,34 @@ def clean_group_link(link):
         link = f"@{link}"
     return link
 
+# --- Get account info with caching ---
+async def get_account_info(session_str, index):
+    cache_key = f"{index}_{hash(session_str)}"
+    if cache_key in account_cache:
+        return account_cache[cache_key]
+    
+    try:
+        temp_client = Client(f"info_session_{index}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
+        await temp_client.connect()
+        me = await temp_client.get_me()
+        info = {
+            "phone": me.phone_number or "غير معروف",
+            "name": me.first_name or "غير معروف",
+            "connected": True
+        }
+        await temp_client.disconnect()
+        # Cache for 5 minutes
+        account_cache[cache_key] = info
+        return info
+    except:
+        info = {
+            "phone": "غير معروف",
+            "name": "غير متصل",
+            "connected": False
+        }
+        account_cache[cache_key] = info
+        return info
+
 # --- Auto Leave Channels (After 12 Hours) ---
 async def auto_leave_channels():
     global db
@@ -178,12 +208,24 @@ async def auto_leave_channels():
             print(f"❌ Auto leave error: {e}")
             await asyncio.sleep(60)
 
-# --- Auto Post Loop ---
+# --- Optimized Auto Post Loop ---
 async def auto_posting_loop():
-    global db
+    global db, account_cache
     account_index = 0
     
     asyncio.create_task(auto_leave_channels())
+    
+    # Pre-warm accounts
+    active_clients = []
+    for idx, session_str in enumerate(db["accounts"]):
+        try:
+            client = Client(f"active_session_{idx}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
+            await client.start()
+            active_clients.append(client)
+            print(f"✅ Account {idx+1} connected and ready")
+        except Exception as e:
+            print(f"❌ Failed to connect account {idx+1}: {e}")
+            active_clients.append(None)
     
     while db["is_running"]:
         if not db["accounts"] or not db["templates"] or not db["groups"]:
@@ -191,12 +233,11 @@ async def auto_posting_loop():
             save_data(db)
             break
         
-        session_str = db["accounts"][account_index]
-        account_number = account_index + 1
+        # Get current client
+        current_client = active_clients[account_index] if account_index < len(active_clients) else None
         
-        try:
-            user_app = Client(f"user_session_{account_index}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
-            await user_app.start()
+        if current_client:
+            account_number = account_index + 1
             
             for group in db["groups"]:
                 if not db["is_running"]:
@@ -212,7 +253,7 @@ async def auto_posting_loop():
                 template = random.choice(db["templates"])
                 
                 try:
-                    sent_msg = await user_app.send_message(group, template)
+                    sent_msg = await current_client.send_message(group, template)
                     db["stats"]["sent_count"] += 1
                     
                     if group not in db["last_message"]:
@@ -228,11 +269,6 @@ async def auto_posting_loop():
                     print(f"❌ Acc {account_number} failed to {group}: {e}")
                 
                 await asyncio.sleep(2)
-            
-            await user_app.stop()
-            
-        except Exception as e:
-            print(f"❌ Error in acc {account_number}: {e}")
         
         # حساب المؤقت: كل حساب يرسل بعد انتهاء دورة جميع الحسابات
         timer_value = db.get("timer", 200)
@@ -241,6 +277,14 @@ async def auto_posting_loop():
         await asyncio.sleep(total_cycle_time)
         
         account_index = (account_index + 1) % len(db["accounts"])
+    
+    # Cleanup
+    for client in active_clients:
+        if client:
+            try:
+                await client.stop()
+            except:
+                pass
 
 # --- Auto Join on Reply (Any user) ---
 @app.on_message(filters.text & filters.private, group=1)
@@ -252,6 +296,7 @@ async def handle_replies(client: Client, message: Message):
     if not links:
         return
     
+    # Use first available account
     for idx, session_str in enumerate(db["accounts"]):
         try:
             user_app = Client(f"reply_session_{idx}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
@@ -382,6 +427,10 @@ async def handle_callback(client: Client, callback_query):
                 await callback_query.message.reply_text(f"🗑 تم حذف الحساب رقم {index+1} (تعذر تسجيل الخروج: {e})")
             save_data(db)
             await callback_query.message.delete()
+            
+            # Clear cache for this account
+            global account_cache
+            account_cache = {}
         else:
             await callback_query.answer("العنصر غير موجود")
     
@@ -523,6 +572,11 @@ async def handle_menu(client: Client, message: Message):
             db["accounts"].append(session_str)
             db["user_state"].pop(user_id_str, None)
             save_data(db)
+            
+            # Clear cache
+            global account_cache
+            account_cache = {}
+            
             return await message.reply_text(f"✅ تم استرداد الحساب بنجاح!\nالرقم: {me.phone_number}\nالاسم: {me.first_name}")
         except Exception as e:
             return await message.reply_text(f"❌ فشل استرداد الحساب: `{e}`")
@@ -561,17 +615,11 @@ async def handle_menu(client: Client, message: Message):
             return await message.reply_text("❌ لا توجد حسابات مضافة.")
         msg = "📋 الحسابات المضافة:\n\n"
         for i, session_str in enumerate(db["accounts"]):
-            try:
-                # محاولة جلب معلومات الحساب
-                temp_client = Client(f"info_session_{i}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
-                await temp_client.connect()
-                me = await temp_client.get_me()
-                phone = me.phone_number or "غير معروف"
-                name = me.first_name or "غير معروف"
-                await temp_client.disconnect()
-                msg += f"{i+1}. 📱 {phone} - 👤 {name}\n"
-            except:
-                msg += f"{i+1}. الحساب {i+1} (غير متصل)\n"
+            info = await get_account_info(session_str, i)
+            phone = info["phone"]
+            name = info["name"]
+            status = "✅" if info["connected"] else "❌"
+            msg += f"{i+1}. {status} 📱 {phone} - 👤 {name}\n"
         await message.reply_text(msg)
 
     elif text in MENU_ACTIONS["groups"]:
@@ -600,16 +648,11 @@ async def handle_menu(client: Client, message: Message):
             return await message.reply_text("❌ لا توجد حسابات لحذفها.")
         
         # عرض قائمة للحذف مع عرض رقم الهاتف
-        def display_account(item, index):
-            try:
-                temp_client = Client(f"display_session_{index}", api_id=API_ID, api_hash=API_HASH, session_string=item)
-                temp_client.connect()
-                me = temp_client.get_me()
-                phone = me.phone_number or "غير معروف"
-                temp_client.disconnect()
-                return f"{index+1}. 📱 {phone}"
-            except:
-                return f"{index+1}. الحساب {index+1} (غير متصل)"
+        async def display_account(item, index):
+            info = await get_account_info(item, index)
+            phone = info["phone"]
+            status = "✅" if info["connected"] else "❌"
+            return f"{index+1}. {status} 📱 {phone}"
         
         keyboard = create_selection_list(db["accounts"], "account", "delete", display_account)
         await message.reply_text(
@@ -711,6 +754,8 @@ async def handle_menu(client: Client, message: Message):
         db["is_running"] = False
         db["joined_channels"] = {}
         save_data(db)
+        global account_cache
+        account_cache = {}
         await message.reply_text("🗑 تم حذف جميع الحسابات والكليشات والكروبات.")
 
     else:
