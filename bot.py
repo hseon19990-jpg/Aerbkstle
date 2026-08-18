@@ -37,6 +37,8 @@ DATA_FILE = "/app/data/bot_data.json"
 login_sessions = {}
 # Cache for account info to avoid repeated connections
 account_cache = {}
+posting_task = None
+auto_leave_task = None
 
 # --- Load/Save Data ---
 def load_data():
@@ -109,6 +111,7 @@ MENU_ACTIONS = {
     "groups": {"📋 قائمة الكروبات", "قائمة الكروبات", "📋 Groups"},
     "add_account": {"➕ إضافة حساب", "إضافة حساب", "➕ Add Acc"},
     "recover_account": {"🔄 استرداد حساب", "استرداد حساب", "🔄 Recover"},
+    "delete_account": {"🗑 حذف حساب", "حذف حساب", "🗑 Delete Acc"},
     "add_text": {"📝 إضافة كليشة", "إضافة كليشة", "إضافة كليشه", "📝 Add Text"},
     "delete_text": {"🗑 حذف كليشة", "حذف كليشة", "حذف كليشه", "🗑 Del Text"},
     "add_group": {"📢 إضافة كروب", "إضافة كروب", "إضافة قروب", "📢 Add Group"},
@@ -119,6 +122,28 @@ MENU_ACTIONS = {
     "stats": {"📊 الإحصائيات", "الإحصائيات", "📊 Stats"},
     "clear": {"🗑 حذف الكل", "حذف الكل", "🗑 Clear All"},
 }
+
+def normalize_button_text(value):
+    """Normalize Telegram button text before comparing it with menu labels."""
+    return re.sub(
+        r"\s+",
+        " ",
+        value.replace("\ufe0f", "").replace("\u200d", "").strip(),
+    ).casefold()
+
+
+NORMALIZED_MENU_ACTIONS = {
+    action: {normalize_button_text(label) for label in labels}
+    for action, labels in MENU_ACTIONS.items()
+}
+
+
+def get_menu_action(text):
+    normalized_text = normalize_button_text(text)
+    for action, labels in NORMALIZED_MENU_ACTIONS.items():
+        if normalized_text in labels:
+            return action
+    return None
 
 # --- Extract links from text ---
 def extract_links(text):
@@ -210,81 +235,95 @@ async def auto_leave_channels():
 
 # --- Optimized Auto Post Loop ---
 async def auto_posting_loop():
-    global db, account_cache
+    global db, account_cache, auto_leave_task
     account_index = 0
-    
-    asyncio.create_task(auto_leave_channels())
-    
-    # Pre-warm accounts
     active_clients = []
-    for idx, session_str in enumerate(db["accounts"]):
-        try:
-            client = Client(f"active_session_{idx}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
-            await client.start()
-            active_clients.append(client)
-            print(f"✅ Account {idx+1} connected and ready")
-        except Exception as e:
-            print(f"❌ Failed to connect account {idx+1}: {e}")
-            active_clients.append(None)
-    
-    while db["is_running"]:
-        if not db["accounts"] or not db["templates"] or not db["groups"]:
-            db["is_running"] = False
-            save_data(db)
-            break
-        
-        # Get current client
-        current_client = active_clients[account_index] if account_index < len(active_clients) else None
-        
-        if current_client:
-            account_number = account_index + 1
-            
-            for group in db["groups"]:
-                if not db["is_running"]:
-                    break
-                
-                if group in db.get("last_message", {}):
-                    last_msg = db["last_message"][group]
-                    if last_msg.get("from_our_account", False):
-                        print(f"⏭️ Skip {group}")
-                        continue
-                
-                # اختيار كليشة عشوائية من القائمة
-                template = random.choice(db["templates"])
-                
-                try:
-                    sent_msg = await current_client.send_message(group, template)
-                    db["stats"]["sent_count"] += 1
-                    
-                    if group not in db["last_message"]:
-                        db["last_message"][group] = {}
-                    db["last_message"][group]["from_our_account"] = True
-                    db["last_message"][group]["message_id"] = sent_msg.id
-                    
-                    save_data(db)
-                    print(f"✅ Acc {account_number} sent to {group}")
-                except Exception as e:
-                    db["stats"]["failed_count"] += 1
-                    save_data(db)
-                    print(f"❌ Acc {account_number} failed to {group}: {e}")
-                
-                await asyncio.sleep(2)
-        
-        # حساب المؤقت: كل حساب يرسل بعد انتهاء دورة جميع الحسابات
-        timer_value = db.get("timer", 200)
-        total_cycle_time = timer_value * len(db["accounts"])
-        print(f"⏱ Waiting {total_cycle_time}s for next account cycle...")
-        await asyncio.sleep(total_cycle_time)
-        
-        account_index = (account_index + 1) % len(db["accounts"])
-    
-    # Cleanup
-    for client in active_clients:
-        if client:
+    auto_leave_task = asyncio.create_task(auto_leave_channels())
+
+    try:
+        # Pre-warm accounts
+        for idx, session_str in enumerate(db["accounts"]):
             try:
-                await client.stop()
-            except:
+                client = Client(
+                    f"active_session_{idx}",
+                    api_id=API_ID,
+                    api_hash=API_HASH,
+                    session_string=session_str,
+                )
+                await client.start()
+                active_clients.append(client)
+                print(f"✅ Account {idx+1} connected and ready")
+            except Exception as e:
+                print(f"❌ Failed to connect account {idx+1}: {e}")
+                active_clients.append(None)
+
+        while db["is_running"]:
+            if not db["accounts"] or not db["templates"] or not db["groups"]:
+                db["is_running"] = False
+                save_data(db)
+                break
+
+            # Get current client
+            current_client = (
+                active_clients[account_index]
+                if account_index < len(active_clients)
+                else None
+            )
+
+            if current_client:
+                account_number = account_index + 1
+
+                for group in db["groups"]:
+                    if not db["is_running"]:
+                        break
+
+                    if group in db.get("last_message", {}):
+                        last_msg = db["last_message"][group]
+                        if last_msg.get("from_our_account", False):
+                            print(f"⏭️ Skip {group}")
+                            continue
+
+                    template = random.choice(db["templates"])
+
+                    try:
+                        sent_msg = await current_client.send_message(group, template)
+                        db["stats"]["sent_count"] += 1
+
+                        if group not in db["last_message"]:
+                            db["last_message"][group] = {}
+                        db["last_message"][group]["from_our_account"] = True
+                        db["last_message"][group]["message_id"] = sent_msg.id
+
+                        save_data(db)
+                        print(f"✅ Acc {account_number} sent to {group}")
+                    except Exception as e:
+                        db["stats"]["failed_count"] += 1
+                        save_data(db)
+                        print(f"❌ Acc {account_number} failed to {group}: {e}")
+
+                    await asyncio.sleep(2)
+
+            # The timer is the interval between account cycles.
+            timer_value = max(1, int(db.get("timer", 200)))
+            print(f"⏱ Waiting {timer_value}s for next account cycle...")
+            await asyncio.sleep(timer_value)
+
+            account_index = (account_index + 1) % len(db["accounts"])
+    finally:
+        if auto_leave_task and not auto_leave_task.done():
+            auto_leave_task.cancel()
+            try:
+                await auto_leave_task
+            except asyncio.CancelledError:
                 pass
+            auto_leave_task = None
+
+        for client in active_clients:
+            if client:
+                try:
+                    await client.stop()
+                except Exception:
+                    pass
 
 # --- Auto Join on Reply (Any user) ---
 @app.on_message(filters.text & filters.private, group=1)
@@ -436,14 +475,21 @@ async def handle_callback(client: Client, callback_query):
     await callback_query.answer()
 
 # --- Main handler ---
-@app.on_message(filters.user(OWNER_ID) & filters.text)
+@app.on_message(filters.private & filters.user(OWNER_ID) & filters.text)
 async def handle_menu(client: Client, message: Message):
     text = message.text.strip()
     if text.lower().startswith("/start"):
         return
 
     user_id_str = str(OWNER_ID)
+    action = get_menu_action(text)
     state = db["user_state"].get(user_id_str)
+
+    # A button press must always be handled as a menu action. This prevents a
+    # stale WAITING_TIMER/WAITING_* state from swallowing the other buttons.
+    if action is not None:
+        db["user_state"].pop(user_id_str, None)
+        state = None
 
     # --- States ---
     if state == "WAITING_PHONE":
@@ -599,16 +645,18 @@ async def handle_menu(client: Client, message: Message):
         return await message.reply_text(f"✅ تمت إضافة الكروب: {group}")
 
     elif state == "WAITING_TIMER":
-        if text.isdigit():
+        if text.isdigit() and 1 <= int(text) <= 86400:
             db["timer"] = int(text)
             db["user_state"].pop(user_id_str, None)
             save_data(db)
             return await message.reply_text(f"✅ تم ضبط المؤقت على {text} ثانية")
         else:
-            return await message.reply_text("❌ أرسل رقمًا صحيحًا للثواني")
+            return await message.reply_text(
+                "❌ أرسل رقمًا صحيحًا بين 1 و86400 للثواني"
+            )
 
     # --- Menu ---
-    if text in MENU_ACTIONS["accounts"]:
+    if action == "accounts":
         if not db["accounts"]:
             return await message.reply_text("❌ لا توجد حسابات مضافة.")
         msg = "📋 الحسابات المضافة:\n\n"
@@ -620,7 +668,7 @@ async def handle_menu(client: Client, message: Message):
             msg += f"{i+1}. {status} 📱 {phone} - 👤 {name}\n"
         await message.reply_text(msg)
 
-    elif text in MENU_ACTIONS["groups"]:
+    elif action == "groups":
         if not db["groups"]:
             return await message.reply_text("❌ لا توجد كروبات مضافة.")
         msg = "📋 الكروبات المضافة:\n\n"
@@ -628,12 +676,12 @@ async def handle_menu(client: Client, message: Message):
             msg += f"{i}. {g}\n"
         await message.reply_text(msg)
 
-    elif text in MENU_ACTIONS["add_account"]:
+    elif action == "add_account":
         db["user_state"][user_id_str] = "WAITING_PHONE"
         save_data(db)
         await message.reply_text("📱 أرسل رقم الهاتف مع مفتاح الدولة:\nمثال: +9647800000000")
 
-    elif text in MENU_ACTIONS["recover_account"]:
+    elif action == "recover_account":
         db["user_state"][user_id_str] = "WAITING_RECOVER"
         save_data(db)
         await message.reply_text(
@@ -641,7 +689,7 @@ async def handle_menu(client: Client, message: Message):
             "ملاحظة: يمكنك الحصول على الجلسة من تطبيقات استخراج الجلسات"
         )
 
-    elif text in MENU_ACTIONS["delete_account"]:
+    elif action == "delete_account":
         if not db["accounts"]:
             return await message.reply_text("❌ لا توجد حسابات لحذفها.")
         
@@ -658,14 +706,14 @@ async def handle_menu(client: Client, message: Message):
             reply_markup=keyboard
         )
 
-    elif text in MENU_ACTIONS["add_text"]:
+    elif action == "add_text":
         db["user_state"][user_id_str] = "WAITING_TEMPLATE"
         save_data(db)
         await message.reply_text(
             "📝 أرسل الكليشة الجديدة (يمكنك إرسال عدة كليشات، كل كليشة في سطر منفصل):"
         )
 
-    elif text in MENU_ACTIONS["delete_text"]:
+    elif action == "delete_text":
         if not db["templates"]:
             return await message.reply_text("❌ لا توجد كليشات لحذفها.")
         
@@ -676,12 +724,12 @@ async def handle_menu(client: Client, message: Message):
             reply_markup=keyboard
         )
 
-    elif text in MENU_ACTIONS["add_group"]:
+    elif action == "add_group":
         db["user_state"][user_id_str] = "WAITING_GROUP"
         save_data(db)
         await message.reply_text("📢 أرسل معرف الكروب أو رابطه:\nمثال: @mygroup")
 
-    elif text in MENU_ACTIONS["delete_group"]:
+    elif action == "delete_group":
         if not db["groups"]:
             return await message.reply_text("❌ لا توجد كروبات لحذفها.")
         
@@ -692,15 +740,16 @@ async def handle_menu(client: Client, message: Message):
             reply_markup=keyboard
         )
 
-    elif text in MENU_ACTIONS["start"]:
+    elif action == "start":
         if db["is_running"]:
             return await message.reply_text("⚠️ البوت يعمل حاليًا بالفعل.")
         if not db["accounts"] or not db["templates"] or not db["groups"]:
             return await message.reply_text("❌ يجب إضافة حساب وكليشة وكروب أولًا.")
         
+        global posting_task
         db["is_running"] = True
         save_data(db)
-        asyncio.create_task(auto_posting_loop())
+        posting_task = asyncio.create_task(auto_posting_loop())
         timer_value = db.get('timer', 200)
         total_cycle = timer_value * len(db["accounts"])
         await message.reply_text(
@@ -712,14 +761,21 @@ async def handle_menu(client: Client, message: Message):
             f"📢 عدد الكروبات: {len(db['groups'])}"
         )
 
-    elif text in MENU_ACTIONS["stop"]:
+    elif action == "stop":
         if not db["is_running"]:
             return await message.reply_text("⚠️ البوت متوقف حاليًا.")
         db["is_running"] = False
         save_data(db)
+        if posting_task and not posting_task.done():
+            posting_task.cancel()
+            try:
+                await posting_task
+            except asyncio.CancelledError:
+                pass
+            posting_task = None
         await message.reply_text("🛑 تم إيقاف البوت.")
 
-    elif text in MENU_ACTIONS["timer"]:
+    elif action == "timer":
         db["user_state"][user_id_str] = "WAITING_TIMER"
         save_data(db)
         await message.reply_text(
@@ -728,7 +784,7 @@ async def handle_menu(client: Client, message: Message):
             f"ملاحظة: كل حساب سيرسل رسالة بعد مرور هذا الوقت على إرسال الحساب السابق"
         )
 
-    elif text in MENU_ACTIONS["stats"]:
+    elif action == "stats":
         status = "🟢 يعمل" if db["is_running"] else "🔴 متوقف"
         timer_value = db.get('timer', 200)
         total_cycle = timer_value * len(db["accounts"]) if db["accounts"] else 0
@@ -744,7 +800,7 @@ async def handle_menu(client: Client, message: Message):
             f"❌ فشل الإرسال: {db['stats']['failed_count']}"
         )
 
-    elif text in MENU_ACTIONS["clear"]:
+    elif action == "clear":
         db["accounts"] = []
         db["templates"] = []
         db["groups"] = []
