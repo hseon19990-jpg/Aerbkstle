@@ -52,6 +52,7 @@ def load_data():
             "stats": {"sent_count": 0, "failed_count": 0},
             "user_state": {},
             "last_message": {},
+            "outgoing_messages": {},
             "joined_channels": {}
         }
         os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
@@ -76,6 +77,7 @@ db["stats"].setdefault("sent_count", 0)
 db["stats"].setdefault("failed_count", 0)
 db.setdefault("user_state", {})
 db.setdefault("last_message", {})
+db.setdefault("outgoing_messages", {})
 db.setdefault("joined_channels", {})
 
 # --- Bot Client ---
@@ -145,28 +147,35 @@ def get_menu_action(text):
             return action
     return None
 
-# --- Extract links from text ---
+# --- Extract channel references from text ---
 def extract_links(text):
-    patterns = [
-        r'https://t\.me/[a-zA-Z0-9_]+',
-        r't\.me/[a-zA-Z0-9_]+',
-        r'@[a-zA-Z0-9_]+'
-    ]
+    pattern = (
+        r'(?:https?://)?t\.me/(?:\+[\w-]+|joinchat/[\w-]+|[A-Za-z0-9_]+)'
+        r'|@[A-Za-z0-9_]{4,}'
+        r'|(?<!\d)-100\d{6,}'
+    )
     links = []
-    for pattern in patterns:
-        matches = re.findall(pattern, text)
-        links.extend(matches)
+    seen = set()
+    for match in re.findall(pattern, text or "", flags=re.IGNORECASE):
+        if match not in seen:
+            links.append(match)
+            seen.add(match)
     return links
 
 # --- Clean group link ---
 def clean_group_link(link):
-    if link.startswith("https://t.ne/"):
-        link = link.replace("https://t.ne/", "@")
-    elif link.startswith("https://t.me/"):
-        link = link.replace("https://t.me/", "@")
-    elif link.startswith("t.me/"):
-        link = link.replace("t.me/", "@")
-    elif not link.startswith("@"):
+    link = link.strip().rstrip(".,;:!?)]}")
+    if re.fullmatch(r"-?\d+", link):
+        return link
+    if link.startswith(("https://t.me/", "http://t.me/", "t.me/")):
+        prefix = "https://t.me/" if link.startswith("https://t.me/") else (
+            "http://t.me/" if link.startswith("http://t.me/") else "t.me/"
+        )
+        suffix = link[len(prefix):]
+        if suffix.startswith(("+", "joinchat/")):
+            return link
+        return f"@{suffix}"
+    if not link.startswith("@"):
         link = f"@{link}"
     return link
 
@@ -198,7 +207,7 @@ async def get_account_info(session_str, index):
         account_cache[cache_key] = info
         return info
 
-# --- Auto Leave Channels (After 12 Hours) ---
+# --- Auto Leave Channels (After 24 Hours) ---
 async def auto_leave_channels():
     global db
     while True:
@@ -209,36 +218,100 @@ async def auto_leave_channels():
             for channel, join_time in db.get("joined_channels", {}).items():
                 try:
                     join_dt = datetime.fromisoformat(join_time)
-                    if now - join_dt > timedelta(hours=12):
+                    if now - join_dt > timedelta(hours=24):
                         to_remove.append(channel)
                 except:
                     to_remove.append(channel)
             
             for channel in to_remove:
+                retry_needed = False
                 for idx, session_str in enumerate(db["accounts"]):
+                    user_app = None
                     try:
-                        user_app = Client(f"leave_session_{idx}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
+                        user_app = Client(
+                            f"leave_session_{idx}",
+                            api_id=API_ID,
+                            api_hash=API_HASH,
+                            session_string=session_str,
+                        )
                         await user_app.start()
                         await user_app.leave_chat(channel)
-                        await user_app.stop()
                         print(f"🚪 Acc {idx+1} left {channel}")
                     except Exception as e:
+                        retry_needed = True
                         print(f"❌ Leave {channel} failed: {e}")
-                
-                db["joined_channels"].pop(channel, None)
-                save_data(db)
+                    finally:
+                        if user_app:
+                            try:
+                                await user_app.stop()
+                            except Exception:
+                                pass
+
+                if not retry_needed:
+                    db["joined_channels"].pop(channel, None)
+                    save_data(db)
             
             await asyncio.sleep(3600)
         except Exception as e:
             print(f"❌ Auto leave error: {e}")
             await asyncio.sleep(60)
 
+def ensure_auto_leave_task():
+    global auto_leave_task
+    if auto_leave_task is None or auto_leave_task.done():
+        auto_leave_task = asyncio.create_task(auto_leave_channels())
+
+
+async def join_channel_for_all_accounts(channel):
+    clean_link = clean_group_link(channel)
+    if not clean_link:
+        return
+    if clean_link in db.get("joined_channels", {}):
+        print(f"⏭️ Already tracking {clean_link}")
+        return
+
+    ensure_auto_leave_task()
+    joined_any = False
+
+    for idx, session_str in enumerate(db["accounts"]):
+        user_app = None
+        try:
+            user_app = Client(
+                f"reply_session_{idx}",
+                api_id=API_ID,
+                api_hash=API_HASH,
+                session_string=session_str,
+            )
+            await user_app.start()
+            try:
+                await user_app.join_chat(clean_link)
+                joined_any = True
+                print(f"✅ Acc {idx+1} joined {clean_link} (will leave after 24h)")
+            except Exception as e:
+                error_text = str(e).upper()
+                if "ALREADY_PARTICIPANT" in error_text or "USER_ALREADY_PARTICIPANT" in error_text:
+                    joined_any = True
+                    print(f"✅ Acc {idx+1} is already in {clean_link}")
+                else:
+                    print(f"❌ Acc {idx+1} failed to join {clean_link}: {e}")
+        except Exception as e:
+            print(f"❌ Error opening acc {idx+1} for {clean_link}: {e}")
+        finally:
+            if user_app:
+                try:
+                    await user_app.stop()
+                except Exception:
+                    pass
+
+    if joined_any:
+        db["joined_channels"][clean_link] = datetime.now().isoformat()
+        save_data(db)
+
 # --- Optimized Auto Post Loop ---
 async def auto_posting_loop():
-    global db, account_cache, auto_leave_task
+    global db, account_cache
     account_index = 0
     active_clients = []
-    auto_leave_task = asyncio.create_task(auto_leave_channels())
 
     try:
         # Pre-warm accounts
@@ -293,6 +366,14 @@ async def auto_posting_loop():
                             db["last_message"][group] = {}
                         db["last_message"][group]["from_our_account"] = True
                         db["last_message"][group]["message_id"] = sent_msg.id
+                        outgoing_key = f"{sent_msg.chat.id}:{sent_msg.id}"
+                        db["outgoing_messages"][outgoing_key] = {
+                            "account_index": account_index,
+                            "sent_at": datetime.now().isoformat(),
+                        }
+                        if len(db["outgoing_messages"]) > 5000:
+                            oldest_key = next(iter(db["outgoing_messages"]))
+                            db["outgoing_messages"].pop(oldest_key, None)
 
                         save_data(db)
                         print(f"✅ Acc {account_number} sent to {group}")
@@ -310,14 +391,6 @@ async def auto_posting_loop():
 
             account_index = (account_index + 1) % len(db["accounts"])
     finally:
-        if auto_leave_task and not auto_leave_task.done():
-            auto_leave_task.cancel()
-            try:
-                await auto_leave_task
-            except asyncio.CancelledError:
-                pass
-            auto_leave_task = None
-
         for client in active_clients:
             if client:
                 try:
@@ -325,38 +398,30 @@ async def auto_posting_loop():
                 except Exception:
                     pass
 
-# --- Auto Join on Reply (Any user) ---
-@app.on_message(filters.text & filters.private, group=1)
+# --- Auto Join when a bot replies to one of our messages ---
+@app.on_message(filters.group & filters.incoming, group=1)
 async def handle_replies(client: Client, message: Message):
-    if message.from_user.id == OWNER_ID:
+    if not message.from_user or not message.from_user.is_bot:
         return
-    
-    links = extract_links(message.text)
+
+    replied_message = message.reply_to_message
+    if not replied_message or not replied_message.from_user:
+        return
+
+    outgoing_key = f"{message.chat.id}:{replied_message.id}"
+    if outgoing_key not in db.get("outgoing_messages", {}):
+        return
+
+    links = extract_links(message.text or message.caption or "")
     if not links:
         return
-    
-    # Use first available account
-    for idx, session_str in enumerate(db["accounts"]):
-        try:
-            user_app = Client(f"reply_session_{idx}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
-            await user_app.start()
-            
-            for link in links:
-                try:
-                    clean_link = clean_group_link(link)
-                    await user_app.join_chat(clean_link)
-                    
-                    db["joined_channels"][clean_link] = datetime.now().isoformat()
-                    save_data(db)
-                    print(f"✅ Acc {idx+1} joined {clean_link} (will leave after 12h)")
-                    
-                except Exception as e:
-                    print(f"❌ Join {link} failed: {e}")
-            
-            await user_app.stop()
-            break
-        except Exception as e:
-            print(f"❌ Error in acc {idx+1}: {e}")
+
+    print(
+        f"🤖 Bot {message.from_user.id} replied to our message in "
+        f"{message.chat.id}; joining {len(links)} channel(s)"
+    )
+    for link in links:
+        await join_channel_for_all_accounts(link)
 
 # --- Track group messages ---
 @app.on_message(filters.group & filters.incoming)
@@ -393,6 +458,8 @@ async def start_cmd(client: Client, message: Message):
             "رقم حسابك لا يطابق رقم المالك الموجود في إعدادات التشغيل."
         )
 
+    if db.get("joined_channels"):
+        ensure_auto_leave_task()
     db["user_state"].pop(str(OWNER_ID), None)
     save_data(db)
     await message.reply_text(
