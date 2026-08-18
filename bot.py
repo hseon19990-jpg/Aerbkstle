@@ -208,8 +208,21 @@ async def track_group_messages(client: Client, message: Message):
         save_data(db)
 
 # --- /start command ---
-@app.on_message(filters.command("start") & filters.user(OWNER_ID))
+@app.on_message(filters.command("start") & filters.private)
 async def start_cmd(client: Client, message: Message):
+    # Do not stay silent when Railway has an incorrect OWNER_ID.
+    # The Telegram ID is safe to show to the person who sent /start and
+    # lets the owner correct the deployment variable immediately.
+    sender_id = message.from_user.id if message.from_user else None
+    if sender_id != OWNER_ID:
+        print(f"Unauthorized /start from Telegram user {sender_id}; configured OWNER_ID={OWNER_ID}")
+        await message.reply_text(
+            "⚠️ هذا الحساب غير مضاف كمالك للبوت.\n\n"
+            f"Telegram ID الخاص بك هو: `{sender_id}`\n"
+            "ضع هذا الرقم في Railway ضمن OWNER_ID ثم أعد تشغيل الخدمة."
+        )
+        return
+
     db["user_state"].pop(str(OWNER_ID), None)
     save_data(db)
     await message.reply_text(
