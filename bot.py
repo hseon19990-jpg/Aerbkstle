@@ -168,7 +168,12 @@ async def auto_posting_loop():
         await asyncio.sleep(db.get("timer", 200))
 
 # --- Handle replies & auto join ---
-@app.on_message(filters.text & filters.private & filters.user(OWNER_ID))
+@app.on_message(
+    filters.text
+    & filters.private
+    & filters.user(OWNER_ID)
+    & filters.regex(r"(?:https?://)?t\.me/[A-Za-z0-9_]+|@[A-Za-z0-9_]+")
+)
 async def handle_replies(client: Client, message: Message):
     links = extract_links(message.text)
     if links:
