@@ -81,7 +81,7 @@ app = Client("auto_post_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TO
 # Keep a small, non-sensitive trace of incoming private messages.  Previously,
 # messages from an account whose OWNER_ID was wrong were silently ignored,
 # which made a running Railway process look like a broken bot.
-@app.on_message(filters.private & filters.incoming)
+@app.on_message(filters.private & filters.incoming, group=2)
 async def trace_private_messages(client: Client, message: Message):
     if not message.from_user:
         return
@@ -241,7 +241,7 @@ async def auto_posting_loop():
         await asyncio.sleep(db.get("timer", 200))
 
 # --- Auto Join on Reply (Any user) ---
-@app.on_message(filters.text & filters.private)
+@app.on_message(filters.text & filters.private, group=1)
 async def handle_replies(client: Client, message: Message):
     if message.from_user.id == OWNER_ID:
         return
