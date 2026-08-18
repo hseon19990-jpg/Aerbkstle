@@ -8,13 +8,34 @@ from pyrogram.types import ReplyKeyboardMarkup, KeyboardButton, Message
 from pyrogram.errors import SessionPasswordNeeded, PhoneCodeInvalid, PhoneCodeExpired
 
 # --- Settings ---
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-OWNER_ID = int(os.environ.get("OWNER_ID", 0))
-API_ID = int(os.environ.get("API_ID", 0))
-API_HASH = os.environ.get("API_HASH")
+BOT_TOKEN = (os.environ.get("BOT_TOKEN") or "").strip()
+OWNER_ID_RAW = (os.environ.get("OWNER_ID") or "").strip()
+API_ID_RAW = (os.environ.get("API_ID") or "").strip()
+API_HASH = (os.environ.get("API_HASH") or "").strip()
 
-# --- Data file path (in Volume) ---
-DATA_FILE = "/app/data/bot_data.json"
+try:
+    OWNER_ID = int(OWNER_ID_RAW)
+    API_ID = int(API_ID_RAW)
+except ValueError as exc:
+    raise RuntimeError("OWNER_ID and API_ID must be numeric environment variables") from exc
+
+missing_settings = []
+if not BOT_TOKEN:
+    missing_settings.append("BOT_TOKEN")
+if OWNER_ID <= 0:
+    missing_settings.append("OWNER_ID")
+if API_ID <= 0:
+    missing_settings.append("API_ID")
+if not API_HASH:
+    missing_settings.append("API_HASH")
+if missing_settings:
+    raise RuntimeError(f"Missing or invalid environment variables: {', '.join(missing_settings)}")
+
+# --- Data file path ---
+# Set DATA_FILE to a mounted volume path when persistent storage is available.
+DATA_FILE = os.environ.get("DATA_FILE") or os.path.join(
+    os.getcwd(), "data", "bot_data.json"
+)
 login_sessions = {}
 
 # --- Data management ---
@@ -59,6 +80,23 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
     ],
     resize_keyboard=True
 )
+
+# Keep keyboards sent by older versions working after the button language change.
+BUTTON_ALIASES = {
+    "➕ إضافة حساب": "➕ Add Acc",
+    "➖ حذف حساب": "➖ Del Acc",
+    "📋 قائمة الحسابات": "📋 Accounts",
+    "📋 قائمة الكروبات": "📋 Groups",
+    "📝 إضافة كليشة": "📝 Add Text",
+    "🗑 حذف كليشة": "🗑 Del Text",
+    "📢 إضافة كروب": "📢 Add Group",
+    "❌ حذف كروب": "❌ Del Group",
+    "▶️ تشغيل البوت": "▶️ Start",
+    "⏹ إيقاف البوت": "⏹ Stop",
+    "⏱ تغيير المؤقت": "⏱ Timer",
+    "📊 الاحصائيات": "📊 Stats",
+    "🗑 مسح الكل": "🗑 Clear All",
+}
 
 # --- Extract links from text ---
 def extract_links(text):
@@ -188,7 +226,7 @@ async def start_cmd(client: Client, message: Message):
 # --- Main handler ---
 @app.on_message(filters.user(OWNER_ID) & filters.text)
 async def handle_menu(client: Client, message: Message):
-    text = message.text
+    text = BUTTON_ALIASES.get(message.text, message.text)
     user_id_str = str(OWNER_ID)
     state = db["user_state"].get(user_id_str)
 
@@ -288,9 +326,7 @@ async def handle_menu(client: Client, message: Message):
     elif state == "WAITING_GROUP":
         group = text.strip()
         # Clean invalid formats
-        if group.startswith("https://t.ne/"):
-            group = group.replace("https://t.ne/", "@")
-        elif group.startswith("https://t.me/"):
+        if group.startswith("https://t.me/"):
             group = group.replace("https://t.me/", "@")
         elif group.startswith("t.me/"):
             group = group.replace("t.me/", "@")
