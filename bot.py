@@ -98,7 +98,8 @@ async def trace_private_messages(client: Client, message: Message):
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
         [KeyboardButton("➕ إضافة حساب"), KeyboardButton("🔄 استرداد حساب")],
-        [KeyboardButton("📋 قائمة الحسابات"), KeyboardButton("📋 قائمة الكروبات")],
+        [KeyboardButton("🗑 حذف حساب"), KeyboardButton("📋 قائمة الحسابات")],
+        [KeyboardButton("📋 قائمة الكروبات")],
         [KeyboardButton("📝 إضافة كليشة"), KeyboardButton("🗑 حذف كليشة")],
         [KeyboardButton("📢 إضافة كروب"), KeyboardButton("❌ حذف كروب")],
         [KeyboardButton("▶️ تشغيل البوت"), KeyboardButton("⏹ إيقاف البوت")],
@@ -759,15 +760,25 @@ async def handle_menu(client: Client, message: Message):
     elif action == "delete_account":
         if not db["accounts"]:
             return await message.reply_text("❌ لا توجد حسابات لحذفها.")
-        
-        # عرض قائمة للحذف مع عرض رقم الهاتف
-        async def display_account(item, index):
-            info = await get_account_info(item, index)
+
+        if db["is_running"]:
+            return await message.reply_text(
+                "⚠️ أوقف البوت أولًا قبل حذف أي حساب."
+            )
+
+        # Build numbered inline buttons with the account phone and status.
+        account_labels = []
+        for index, session_str in enumerate(db["accounts"]):
+            info = await get_account_info(session_str, index)
             phone = info["phone"]
             status = "✅" if info["connected"] else "❌"
-            return f"{index+1}. {status} 📱 {phone}"
-        
-        keyboard = create_selection_list(db["accounts"], "account", "delete", display_account)
+            account_labels.append(f"{index+1}. {status} 📱 {phone}")
+
+        keyboard = create_selection_list(
+            account_labels,
+            "account",
+            "delete_account",
+        )
         await message.reply_text(
             "🗑 اختر الحساب لحذفه نهائياً (سيتم تسجيل الخروج):",
             reply_markup=keyboard
