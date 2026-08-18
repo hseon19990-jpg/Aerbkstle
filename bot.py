@@ -77,6 +77,20 @@ db.setdefault("joined_channels", {})
 # --- Bot Client ---
 app = Client("auto_post_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
+# --- Diagnostics ---
+# Keep a small, non-sensitive trace of incoming private messages.  Previously,
+# messages from an account whose OWNER_ID was wrong were silently ignored,
+# which made a running Railway process look like a broken bot.
+@app.on_message(filters.private & filters.incoming)
+async def trace_private_messages(client: Client, message: Message):
+    if not message.from_user:
+        return
+    command = (message.text or message.caption or "<non-text>")[:80].replace("\n", " ")
+    print(
+        f"📨 Incoming private message from user_id={message.from_user.id}: "
+        f"{command!r}"
+    )
+
 # --- Main Keyboard ---
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
@@ -256,8 +270,21 @@ async def track_group_messages(client: Client, message: Message):
         save_data(db)
 
 # --- /start command ---
-@app.on_message(filters.command("start") & filters.user(OWNER_ID))
+@app.on_message(filters.command("start") & filters.private)
 async def start_cmd(client: Client, message: Message):
+    if not message.from_user:
+        return
+
+    if message.from_user.id != OWNER_ID:
+        print(
+            f"⚠️ Unauthorized /start from user_id={message.from_user.id}; "
+            f"configured OWNER_ID={OWNER_ID}"
+        )
+        return await message.reply_text(
+            "⛔ هذا البوت مخصص لمالكه فقط.\n"
+            "رقم حسابك لا يطابق OWNER_ID الموجود في إعدادات التشغيل."
+        )
+
     db["user_state"].pop(str(OWNER_ID), None)
     save_data(db)
     await message.reply_text(
@@ -491,6 +518,11 @@ async def handle_menu(client: Client, message: Message):
         db["joined_channels"] = {}
         save_data(db)
         await message.reply_text("🗑 All cleared!")
+
+    else:
+        await message.reply_text(
+            "لم أفهم الأمر. أرسل /start ثم اختر أحد أزرار القائمة."
+        )
 
 if __name__ == "__main__":
     print("🤖 Bot running...")
