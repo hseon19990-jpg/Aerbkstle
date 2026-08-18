@@ -428,9 +428,8 @@ async def handle_callback(client: Client, callback_query):
             save_data(db)
             await callback_query.message.delete()
             
-            # Clear cache for this account
-            global account_cache
-            account_cache = {}
+            # Clear cache for this account using globals() to avoid SyntaxError
+            globals()['account_cache'] = {}
         else:
             await callback_query.answer("العنصر غير موجود")
     
@@ -574,8 +573,7 @@ async def handle_menu(client: Client, message: Message):
             save_data(db)
             
             # Clear cache
-            global account_cache
-            account_cache = {}
+            globals()['account_cache'] = {}
             
             return await message.reply_text(f"✅ تم استرداد الحساب بنجاح!\nالرقم: {me.phone_number}\nالاسم: {me.first_name}")
         except Exception as e:
@@ -754,9 +752,8 @@ async def handle_menu(client: Client, message: Message):
         db["is_running"] = False
         db["joined_channels"] = {}
         save_data(db)
-        global account_cache
-        account_cache.clear()
-     
+        # Clear cache using globals() to avoid SyntaxError
+        globals()['account_cache'] = {}
         await message.reply_text("🗑 تم حذف جميع الحسابات والكليشات والكروبات.")
 
     else:
