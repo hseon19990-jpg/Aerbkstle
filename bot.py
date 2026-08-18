@@ -7,17 +7,17 @@ from pyrogram import Client, filters
 from pyrogram.types import ReplyKeyboardMarkup, KeyboardButton, Message
 from pyrogram.errors import SessionPasswordNeeded, PhoneCodeInvalid, PhoneCodeExpired
 
-# --- الإعدادات الأساسية ---
+# --- Settings ---
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 OWNER_ID = int(os.environ.get("OWNER_ID", 0))
 API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH")
 
-# --- مسار حفظ البيانات ---
+# --- Data file path (in Volume) ---
 DATA_FILE = "/app/data/bot_data.json"
 login_sessions = {}
 
-# --- إدارة قاعدة البيانات ---
+# --- Data management ---
 def load_data():
     if not os.path.exists(DATA_FILE):
         default_data = {
@@ -28,7 +28,7 @@ def load_data():
             "is_running": False,
             "stats": {"sent_count": 0, "failed_count": 0},
             "user_state": {},
-            "last_message": {}  # لتخزين آخر رسالة في كل كروب
+            "last_message": {}
         }
         os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
         with open(DATA_FILE, "w", encoding="utf-8") as f:
@@ -43,24 +43,24 @@ def save_data(data):
 
 db = load_data()
 
-# --- إنشاء البوت ---
+# --- Bot Client ---
 app = Client("auto_post_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# --- لوحة التحكم ---
+# --- Main Keyboard ---
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
-        [KeyboardButton("➕ إضافة حساب"), KeyboardButton("➖ حذف حساب")],
-        [KeyboardButton("📋 قائمة الحسابات"), KeyboardButton("📋 قائمة الكروبات")],
-        [KeyboardButton("📝 إضافة كليشة"), KeyboardButton("🗑 حذف كليشة")],
-        [KeyboardButton("📢 إضافة كروب"), KeyboardButton("❌ حذف كروب")],
-        [KeyboardButton("▶️ تشغيل البوت"), KeyboardButton("⏹ إيقاف البوت")],
-        [KeyboardButton("⏱ تغيير المؤقت"), KeyboardButton("📊 الاحصائيات")],
-        [KeyboardButton("🗑 مسح الكل")]
+        [KeyboardButton("➕ Add Acc"), KeyboardButton("➖ Del Acc")],
+        [KeyboardButton("📋 Accounts"), KeyboardButton("📋 Groups")],
+        [KeyboardButton("📝 Add Text"), KeyboardButton("🗑 Del Text")],
+        [KeyboardButton("📢 Add Group"), KeyboardButton("❌ Del Group")],
+        [KeyboardButton("▶️ Start"), KeyboardButton("⏹ Stop")],
+        [KeyboardButton("⏱ Timer"), KeyboardButton("📊 Stats")],
+        [KeyboardButton("🗑 Clear All")]
     ],
     resize_keyboard=True
 )
 
-# --- دالة لاستخراج الروابط من النص ---
+# --- Extract links from text ---
 def extract_links(text):
     patterns = [
         r'https://t\.me/[a-zA-Z0-9_]+',
@@ -73,20 +73,17 @@ def extract_links(text):
         links.extend(matches)
     return links
 
-# --- حلقة النشر التلقائي (المفهوم الجديد) ---
+# --- Auto Post Loop (New concept) ---
 async def auto_posting_loop():
     global db
-    
-    account_index = 0  # مؤشر للحساب الحالي
+    account_index = 0
     
     while db["is_running"]:
-        # التحقق من وجود بيانات كافية
         if not db["accounts"] or not db["templates"] or not db["groups"]:
             db["is_running"] = False
             save_data(db)
             break
         
-        # اختيار الحساب الحالي (بالتناوب)
         session_str = db["accounts"][account_index]
         account_number = account_index + 1
         
@@ -94,16 +91,14 @@ async def auto_posting_loop():
             user_app = Client(f"user_session_{account_index}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
             await user_app.start()
             
-            # إرسال رسالة إلى كل الكروبات
             for group in db["groups"]:
                 if not db["is_running"]:
                     break
                 
-                # التحقق من أن الكروب ليس ميتاً
                 if group in db.get("last_message", {}):
                     last_msg = db["last_message"][group]
                     if last_msg.get("from_our_account", False):
-                        print(f"⏭️ تخطي {group} - آخر رسالة من حسابنا")
+                        print(f"⏭️ Skip {group} - last msg from us")
                         continue
                 
                 template = random.choice(db["templates"])
@@ -112,33 +107,29 @@ async def auto_posting_loop():
                     sent_msg = await user_app.send_message(group, template)
                     db["stats"]["sent_count"] += 1
                     
-                    # تسجيل أن هذه الرسالة من حسابنا
                     if group not in db["last_message"]:
                         db["last_message"][group] = {}
                     db["last_message"][group]["from_our_account"] = True
                     db["last_message"][group]["message_id"] = sent_msg.id
                     
                     save_data(db)
-                    print(f"✅ الحساب {account_number} أرسل إلى {group}")
+                    print(f"✅ Acc {account_number} sent to {group}")
                 except Exception as e:
                     db["stats"]["failed_count"] += 1
                     save_data(db)
-                    print(f"❌ فشل الحساب {account_number} إلى {group}: {e}")
+                    print(f"❌ Acc {account_number} failed to {group}: {e}")
                 
-                await asyncio.sleep(2)  # انتظار قصير بين الرسائل
+                await asyncio.sleep(2)
             
             await user_app.stop()
             
         except Exception as e:
-            print(f"❌ خطأ في الحساب {account_number}: {e}")
+            print(f"❌ Error in acc {account_number}: {e}")
         
-        # التبديل إلى الحساب التالي
         account_index = (account_index + 1) % len(db["accounts"])
-        
-        # انتظار المؤقت قبل الحساب التالي
         await asyncio.sleep(db.get("timer", 200))
 
-# --- مراقبة الردود والانضمام التلقائي ---
+# --- Handle replies & auto join ---
 @app.on_message(filters.text & filters.private & filters.user(OWNER_ID))
 async def handle_replies(client: Client, message: Message):
     links = extract_links(message.text)
@@ -154,66 +145,54 @@ async def handle_replies(client: Client, message: Message):
                             await user_app.join_chat(link)
                         elif 't.me' in link:
                             await user_app.join_chat(link)
-                        print(f"✅ الحساب {idx+1} انضم إلى {link}")
+                        print(f"✅ Acc {idx+1} joined {link}")
                     except Exception as e:
-                        print(f"❌ فشل انضمام الحساب {idx+1} إلى {link}: {e}")
+                        print(f"❌ Acc {idx+1} join {link} failed: {e}")
                 
                 await user_app.stop()
                 break
             except Exception as e:
-                print(f"❌ خطأ في حساب {idx+1}: {e}")
+                print(f"❌ Error in acc {idx+1}: {e}")
 
-# --- مراقبة الرسائل في الكروبات لتحديث حالة التفاعل ---
+# --- Track group messages ---
 @app.on_message(filters.group & filters.incoming)
 async def track_group_messages(client: Client, message: Message):
     chat_id = str(message.chat.id)
     chat_username = f"@{message.chat.username}" if message.chat.username else None
     
-    # التحقق من أن الكروب في قائمتنا
     if chat_id in db["groups"] or (chat_username and chat_username in db["groups"]):
         if chat_id not in db["last_message"]:
             db["last_message"][chat_id] = {}
-        
-        # التحقق إذا كانت الرسالة من حسابنا
-        is_our_account = False
-        # يمكن تحسين هذه الطريقة
-        for session_str in db["accounts"]:
-            try:
-                # محاولة معرفة إذا كان المرسل هو حسابنا
-                pass
-            except:
-                pass
         
         db["last_message"][chat_id]["from_our_account"] = False
         db["last_message"][chat_id]["message_id"] = message.id
         db["last_message"][chat_id]["sender"] = message.from_user.id if message.from_user else None
         save_data(db)
 
-# --- أمر /start ---
+# --- /start command ---
 @app.on_message(filters.command("start") & filters.user(OWNER_ID))
 async def start_cmd(client: Client, message: Message):
     db["user_state"].pop(str(OWNER_ID), None)
     save_data(db)
     await message.reply_text(
-        "👋 أهلاً بك في بوت النشر التلقائي!\n\n"
-        "📌 يمكنك التحكم في البوت من خلال الأزرار أدناه:\n"
-        "• أضف حساب للنشر من خلاله\n"
-        "• أضف كليشات للرسائل\n"
-        "• أضف كروبات للنشر فيها\n"
-        "• حدد المؤقت بين كل حساب والآخر\n\n"
-        "⚠️ المؤقت الجديد: كل حساب يرسل حسب الدور\n"
-        "مثال: 10 حسابات، مؤقت 200 ثانية = كل حساب يرسل كل 2000 ثانية",
+        "👋 Welcome to Auto Post Bot!\n\n"
+        "📌 Use buttons below:\n"
+        "• Add accounts\n"
+        "• Add texts\n"
+        "• Add groups\n"
+        "• Set timer\n\n"
+        f"⏱ Timer: {db.get('timer', 200)}s between accounts",
         reply_markup=MAIN_KEYBOARD
     )
 
-# --- معالج الرسائل والأوامر ---
+# --- Main handler ---
 @app.on_message(filters.user(OWNER_ID) & filters.text)
 async def handle_menu(client: Client, message: Message):
     text = message.text
     user_id_str = str(OWNER_ID)
     state = db["user_state"].get(user_id_str)
 
-    # 1. مرحلة إدخال رقم الهاتف
+    # --- States ---
     if state == "WAITING_PHONE":
         phone = text.strip()
         session_name = f"temp_session_{OWNER_ID}"
@@ -229,21 +208,20 @@ async def handle_menu(client: Client, message: Message):
             }
             db["user_state"][user_id_str] = "WAITING_OTP"
             save_data(db)
-            return await message.reply_text("📩 تم إرسال كود التحقق إلى حسابك في تليجرام.\nأرسل رمز التحقق الآن:")
+            return await message.reply_text("📩 Code sent. Enter OTP:")
         except Exception as e:
             await temp_client.disconnect()
             if os.path.exists(f"{session_name}.session"):
                 os.remove(f"{session_name}.session")
-            return await message.reply_text(f"❌ حدث خطأ أثناء إرسال الكود:\n`{e}`\nيرجى إعادة المحاولة مع مفتاح الدولة (مثال: +91... أو +964...).")
+            return await message.reply_text(f"❌ Error: `{e}`")
 
-    # 2. مرحلة إدخال رمز التحقق OTP
     elif state == "WAITING_OTP":
         otp = text.strip()
         session_info = login_sessions.get(OWNER_ID)
         if not session_info:
             db["user_state"].pop(user_id_str, None)
             save_data(db)
-            return await message.reply_text("❌ انتهت الجلسة، اضغط على إضافة حساب وابدأ من جديد.")
+            return await message.reply_text("❌ Session expired. Try again.")
 
         temp_client = session_info["client"]
         session_name = session_info["session_name"]
@@ -259,13 +237,13 @@ async def handle_menu(client: Client, message: Message):
             del login_sessions[OWNER_ID]
             db["user_state"].pop(user_id_str, None)
             save_data(db)
-            return await message.reply_text("✅ تم تسجيل الدخول وإضافة الحساب بنجاح!")
+            return await message.reply_text("✅ Account added!")
         except SessionPasswordNeeded:
             db["user_state"][user_id_str] = "WAITING_PASSWORD"
             save_data(db)
-            return await message.reply_text("🔐 الحساب محمي بالتحقق بخطوتين (2FA).\nأرسل كلمة المرور الخاصة بك:")
+            return await message.reply_text("🔐 2FA enabled. Enter password:")
         except (PhoneCodeInvalid, PhoneCodeExpired):
-            return await message.reply_text("❌ رمز التحقق غير صحيح أو منتهي الصلاحية. يرجى إرسال الرمز الصحيح:")
+            return await message.reply_text("❌ Invalid OTP. Try again:")
         except Exception as e:
             await temp_client.disconnect()
             if os.path.exists(f"{session_name}.session"):
@@ -273,16 +251,15 @@ async def handle_menu(client: Client, message: Message):
             del login_sessions[OWNER_ID]
             db["user_state"].pop(user_id_str, None)
             save_data(db)
-            return await message.reply_text(f"❌ خطأ: `{e}`")
+            return await message.reply_text(f"❌ Error: `{e}`")
 
-    # 3. مرحلة إدخال كلمة المرور (2FA)
     elif state == "WAITING_PASSWORD":
         password = text.strip()
         session_info = login_sessions.get(OWNER_ID)
         if not session_info:
             db["user_state"].pop(user_id_str, None)
             save_data(db)
-            return await message.reply_text("❌ انتهت الجلسة، حاول الإضافة مجدداً.")
+            return await message.reply_text("❌ Session expired.")
 
         temp_client = session_info["client"]
         session_name = session_info["session_name"]
@@ -298,159 +275,152 @@ async def handle_menu(client: Client, message: Message):
             del login_sessions[OWNER_ID]
             db["user_state"].pop(user_id_str, None)
             save_data(db)
-            return await message.reply_text("✅ تم تأكيد كلمة المرور وإضافة الحساب بنجاح!")
+            return await message.reply_text("✅ Account added!")
         except Exception as e:
-            return await message.reply_text(f"❌ كلمة المرور غير صحيحة. حاول مرة أخرى:\n`{e}`")
+            return await message.reply_text(f"❌ Wrong password: `{e}`")
 
-    # إضافة كليشة
     elif state == "WAITING_TEMPLATE":
         db["templates"].append(text)
         db["user_state"].pop(user_id_str, None)
         save_data(db)
-        return await message.reply_text("✅ تم إضافة الكليشة بنجاح.")
+        return await message.reply_text("✅ Text added!")
 
-    # إضافة كروب
     elif state == "WAITING_GROUP":
-        db["groups"].append(text.strip())
+        group = text.strip()
+        # Clean invalid formats
+        if group.startswith("https://t.ne/"):
+            group = group.replace("https://t.ne/", "@")
+        elif group.startswith("https://t.me/"):
+            group = group.replace("https://t.me/", "@")
+        elif group.startswith("t.me/"):
+            group = group.replace("t.me/", "@")
+        
+        if not group.startswith("@"):
+            group = f"@{group}"
+        
+        db["groups"].append(group)
         db["user_state"].pop(user_id_str, None)
         save_data(db)
-        return await message.reply_text("✅ تم إضافة الكروب بنجاح.")
+        return await message.reply_text(f"✅ Group added: {group}")
 
-    # تغيير المؤقت
     elif state == "WAITING_TIMER":
         if text.isdigit():
             db["timer"] = int(text)
             db["user_state"].pop(user_id_str, None)
             save_data(db)
-            return await message.reply_text(f"✅ تم تغيير المؤقت إلى {text} ثانية.")
+            return await message.reply_text(f"✅ Timer set to {text}s")
         else:
-            return await message.reply_text("❌ يرجى إرسال رقم صحيح بالثواني.")
+            return await message.reply_text("❌ Enter a number")
 
-    # --- القوائم الرئيسية ---
-    
-    # عرض قائمة الحسابات
-    if text == "📋 قائمة الحسابات":
+    # --- Main Menu ---
+    if text == "📋 Accounts":
         if not db["accounts"]:
-            return await message.reply_text("❌ لا توجد حسابات مضافة.")
-        
-        msg = "📋 **قائمة الحسابات:**\n\n"
+            return await message.reply_text("❌ No accounts.")
+        msg = "📋 **Accounts:**\n\n"
         for i in range(len(db["accounts"])):
-            msg += f"{i+1}. الحساب {i+1}\n"
-        msg += "\nلحذف حساب استخدم: ➖ حذف حساب"
+            msg += f"{i+1}. Acc {i+1}\n"
         await message.reply_text(msg)
 
-    # عرض قائمة الكروبات
-    elif text == "📋 قائمة الكروبات":
+    elif text == "📋 Groups":
         if not db["groups"]:
-            return await message.reply_text("❌ لا توجد كروبات مضافة.")
-        
-        msg = "📋 **قائمة الكروبات:**\n\n"
-        for i, group in enumerate(db["groups"], 1):
-            msg += f"{i}. {group}\n"
-        msg += "\nلحذف كروب استخدم: ❌ حذف كروب"
+            return await message.reply_text("❌ No groups.")
+        msg = "📋 **Groups:**\n\n"
+        for i, g in enumerate(db["groups"], 1):
+            msg += f"{i}. {g}\n"
         await message.reply_text(msg)
 
-    # إضافة حساب
-    elif text == "➕ إضافة حساب":
+    elif text == "➕ Add Acc":
         db["user_state"][user_id_str] = "WAITING_PHONE"
         save_data(db)
-        await message.reply_text("📱 أرسل الآن رقم الهاتف الخاص بالحساب مع رمز الدولة:\n(مثال: `+919876543210` أو `+9647800000000`)")
+        await message.reply_text("📱 Send phone with country code:\nExample: +9647800000000")
 
-    # حذف حساب
-    elif text == "➖ حذف حساب":
+    elif text == "➖ Del Acc":
         if not db["accounts"]:
-            return await message.reply_text("❌ لا توجد حسابات مضافة حالياً.")
+            return await message.reply_text("❌ No accounts.")
         db["accounts"].pop()
         save_data(db)
-        await message.reply_text("🗑 تم حذف آخر حساب مضاف.")
+        await message.reply_text("🗑 Last account deleted.")
 
-    # إضافة كليشة
-    elif text == "📝 إضافة كليشة":
+    elif text == "📝 Add Text":
         db["user_state"][user_id_str] = "WAITING_TEMPLATE"
         save_data(db)
-        await message.reply_text("📝 أرسل نص الكليشة التي تريد نشرها:")
+        await message.reply_text("📝 Send the text:")
 
-    # حذف كليشة
-    elif text == "🗑 حذف كليشة":
+    elif text == "🗑 Del Text":
         if not db["templates"]:
-            return await message.reply_text("❌ لا توجد كليشات مضافة.")
+            return await message.reply_text("❌ No texts.")
         db["templates"].pop()
         save_data(db)
-        await message.reply_text("🗑 تم حذف آخر كليشة مضافة.")
+        await message.reply_text("🗑 Last text deleted.")
 
-    # إضافة كروب
-    elif text == "📢 إضافة كروب":
+    elif text == "📢 Add Group":
         db["user_state"][user_id_str] = "WAITING_GROUP"
         save_data(db)
-        await message.reply_text("📢 أرسل يوزر الكروب (مثال: @mygroup) أو الآيدي الخاص به:")
+        await message.reply_text("📢 Send group username:\nExample: @mygroup")
 
-    # حذف كروب
-    elif text == "❌ حذف كروب":
+    elif text == "❌ Del Group":
         if not db["groups"]:
-            return await message.reply_text("❌ لا توجد كروبات مضافة.")
+            return await message.reply_text("❌ No groups.")
         db["groups"].pop()
         save_data(db)
-        await message.reply_text("🗑 تم حذف آخر كروب مضاف.")
+        await message.reply_text("🗑 Last group deleted.")
 
-    # تشغيل البوت
-    elif text == "▶️ تشغيل البوت":
+    elif text == "▶️ Start":
         if db["is_running"]:
-            return await message.reply_text("⚠️ البوت يعمل بالفعل!")
+            return await message.reply_text("⚠️ Already running!")
         if not db["accounts"] or not db["templates"] or not db["groups"]:
-            return await message.reply_text("❌ يجب إضافة حساب وكليشة وكروب واحد على الأقل قبل التشغيل.")
+            return await message.reply_text("❌ Need: accounts, texts, groups.")
         
         db["is_running"] = True
         save_data(db)
         asyncio.create_task(auto_posting_loop())
-        await message.reply_text("🚀 تم تشغيل النشر التلقائي بنجاح!\n\n" +
-                                f"📊 عدد الحسابات: {len(db['accounts'])}\n" +
-                                f"⏱ المؤقت: {db.get('timer', 200)} ثانية بين كل حساب\n" +
-                                f"⏰ كل حساب يرسل كل {db.get('timer', 200) * len(db['accounts'])} ثانية")
+        total_time = db.get('timer', 200) * len(db["accounts"])
+        await message.reply_text(
+            f"🚀 Started!\n"
+            f"📊 Accounts: {len(db['accounts'])}\n"
+            f"⏱ Timer: {db.get('timer', 200)}s between accs\n"
+            f"⏰ Each acc sends every {total_time}s"
+        )
 
-    # إيقاف البوت
-    elif text == "⏹ إيقاف البوت":
+    elif text == "⏹ Stop":
         if not db["is_running"]:
-            return await message.reply_text("⚠️ البوت متوقف بالفعل!")
+            return await message.reply_text("⚠️ Already stopped!")
         db["is_running"] = False
         save_data(db)
-        await message.reply_text("🛑 تم إيقاف النشر التلقائي.")
+        await message.reply_text("🛑 Stopped.")
 
-    # تغيير المؤقت
-    elif text == "⏱ تغيير المؤقت":
+    elif text == "⏱ Timer":
         db["user_state"][user_id_str] = "WAITING_TIMER"
         save_data(db)
-        await message.reply_text(f"⏱ المؤقت الحالي هو {db.get('timer', 200)} ثانية بين كل حساب.\nأرسل الوقت الجديد بالثواني:")
+        await message.reply_text(f"⏱ Current: {db.get('timer', 200)}s\nSend new timer in seconds:")
 
-    # الاحصائيات
-    elif text == "📊 الاحصائيات":
-        status = "شغال 🟢" if db["is_running"] else "متوقف 🔴"
+    elif text == "📊 Stats":
+        status = "🟢 Running" if db["is_running"] else "🔴 Stopped"
         total_time = db.get('timer', 200) * len(db["accounts"]) if db["accounts"] else 0
-        stats_msg = (
-            f"📊 **إحصائيات البوت:**\n\n"
-            f"🔹 حالة البوت: {status}\n"
-            f"🔹 عدد الحسابات: {len(db['accounts'])}\n"
-            f"🔹 عدد الكليشات: {len(db['templates'])}\n"
-            f"🔹 عدد الكروبات: {len(db['groups'])}\n"
-            f"⏱ المؤقت: {db.get('timer', 200)} ثانية بين كل حساب\n"
-            f"⏰ كل حساب يرسل كل {total_time} ثانية\n\n"
-            f"✅ الرسائل الناجحة: {db['stats']['sent_count']}\n"
-            f"❌ الرسائل الفاشلة: {db['stats']['failed_count']}"
+        await message.reply_text(
+            f"📊 **Stats:**\n\n"
+            f"🔹 Status: {status}\n"
+            f"🔹 Accounts: {len(db['accounts'])}\n"
+            f"🔹 Texts: {len(db['templates'])}\n"
+            f"🔹 Groups: {len(db['groups'])}\n"
+            f"⏱ Timer: {db.get('timer', 200)}s\n"
+            f"⏰ Each acc: {total_time}s\n"
+            f"✅ Sent: {db['stats']['sent_count']}\n"
+            f"❌ Failed: {db['stats']['failed_count']}"
         )
-        await message.reply_text(stats_msg)
-    
-    # مسح الكل
-    elif text == "🗑 مسح الكل":
+
+    elif text == "🗑 Clear All":
         db["accounts"] = []
         db["templates"] = []
         db["groups"] = []
         db["stats"] = {"sent_count": 0, "failed_count": 0}
         db["is_running"] = False
         save_data(db)
-        await message.reply_text("🗑 تم مسح جميع البيانات بنجاح!")
+        await message.reply_text("🗑 All data cleared!")
 
 if __name__ == "__main__":
-    print("🤖 Bot is running with new features...")
-    print(f"👤 Owner ID: {OWNER_ID}")
-    print(f"📊 Data file: {DATA_FILE}")
-    print(f"⏱ Timer: {db.get('timer', 200)} seconds between accounts")
+    print("🤖 Bot running...")
+    print(f"👤 Owner: {OWNER_ID}")
+    print(f"📊 Data: {DATA_FILE}")
+    print(f"⏱ Timer: {db.get('timer', 200)}s")
     app.run()
