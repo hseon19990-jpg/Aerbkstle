@@ -5,7 +5,7 @@ import random
 import re
 from datetime import datetime, timedelta
 from pyrogram import Client, filters
-from pyrogram.types import ReplyKeyboardMarkup, KeyboardButton, Message
+from pyrogram.types import ReplyKeyboardMarkup, KeyboardButton, Message, InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import SessionPasswordNeeded, PhoneCodeInvalid, PhoneCodeExpired
 
 # --- Settings ---
@@ -78,9 +78,6 @@ db.setdefault("joined_channels", {})
 app = Client("auto_post_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 # --- Diagnostics ---
-# Keep a small, non-sensitive trace of incoming private messages.  Previously,
-# messages from an account whose OWNER_ID was wrong were silently ignored,
-# which made a running Railway process look like a broken bot.
 @app.on_message(filters.private & filters.incoming, group=2)
 async def trace_private_messages(client: Client, message: Message):
     if not message.from_user:
@@ -105,8 +102,6 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
-# Keep accepting the old English labels and common Arabic spellings so an
-# existing keyboard does not break after the language change.
 MENU_ACTIONS = {
     "accounts": {"📋 قائمة الحسابات", "قائمة الحسابات", "📋 Accounts"},
     "groups": {"📋 قائمة الكروبات", "قائمة الكروبات", "📋 Groups"},
@@ -122,6 +117,7 @@ MENU_ACTIONS = {
     "stats": {"📊 الإحصائيات", "الإحصائيات", "📊 Stats"},
     "clear": {"🗑 حذف الكل", "حذف الكل", "🗑 Clear All"},
 }
+
 # --- Extract links from text ---
 def extract_links(text):
     patterns = [
@@ -212,6 +208,7 @@ async def auto_posting_loop():
                         print(f"⏭️ Skip {group}")
                         continue
                 
+                # اختيار كليشة عشوائية من القائمة
                 template = random.choice(db["templates"])
                 
                 try:
@@ -237,8 +234,13 @@ async def auto_posting_loop():
         except Exception as e:
             print(f"❌ Error in acc {account_number}: {e}")
         
+        # حساب المؤقت: كل حساب يرسل بعد انتهاء دورة جميع الحسابات
+        timer_value = db.get("timer", 200)
+        total_cycle_time = timer_value * len(db["accounts"])
+        print(f"⏱ Waiting {total_cycle_time}s for next account cycle...")
+        await asyncio.sleep(total_cycle_time)
+        
         account_index = (account_index + 1) % len(db["accounts"])
-        await asyncio.sleep(db.get("timer", 200))
 
 # --- Auto Join on Reply (Any user) ---
 @app.on_message(filters.text & filters.private, group=1)
@@ -317,6 +319,60 @@ async def start_cmd(client: Client, message: Message):
         f"⏱ المؤقت: {db.get('timer', 200)} ثانية",
         reply_markup=MAIN_KEYBOARD
     )
+
+# --- Helper function for selection lists ---
+def create_selection_list(items, item_type, action):
+    """Creates inline keyboard for selecting items to delete"""
+    keyboard = []
+    for i, item in enumerate(items):
+        display_text = f"{i+1}. {item[:30]}..." if len(item) > 30 else f"{i+1}. {item}"
+        keyboard.append([InlineKeyboardButton(display_text, callback_data=f"{action}_{i}")])
+    keyboard.append([InlineKeyboardButton("❌ إلغاء", callback_data="cancel")])
+    return InlineKeyboardMarkup(keyboard)
+
+# --- Handle callback queries for selection ---
+@app.on_callback_query()
+async def handle_callback(client: Client, callback_query):
+    if callback_query.from_user.id != OWNER_ID:
+        return await callback_query.answer("غير مصرح")
+    
+    data = callback_query.data
+    
+    if data == "cancel":
+        await callback_query.message.delete()
+        return await callback_query.answer("تم الإلغاء")
+    
+    if data.startswith("delete_template_"):
+        index = int(data.split("_")[2])
+        if 0 <= index < len(db["templates"]):
+            deleted = db["templates"].pop(index)
+            save_data(db)
+            await callback_query.message.delete()
+            await callback_query.message.reply_text(f"🗑 تم حذف الكليشة: {deleted[:50]}...")
+        else:
+            await callback_query.answer("العنصر غير موجود")
+    
+    elif data.startswith("delete_group_"):
+        index = int(data.split("_")[2])
+        if 0 <= index < len(db["groups"]):
+            deleted = db["groups"].pop(index)
+            save_data(db)
+            await callback_query.message.delete()
+            await callback_query.message.reply_text(f"🗑 تم حذف الكروب: {deleted}")
+        else:
+            await callback_query.answer("العنصر غير موجود")
+    
+    elif data.startswith("delete_account_"):
+        index = int(data.split("_")[2])
+        if 0 <= index < len(db["accounts"]):
+            deleted = db["accounts"].pop(index)
+            save_data(db)
+            await callback_query.message.delete()
+            await callback_query.message.reply_text(f"🗑 تم حذف الحساب رقم {index+1}")
+        else:
+            await callback_query.answer("العنصر غير موجود")
+    
+    await callback_query.answer()
 
 # --- Main handler ---
 @app.on_message(filters.user(OWNER_ID) & filters.text)
@@ -416,10 +472,14 @@ async def handle_menu(client: Client, message: Message):
             return await message.reply_text(f"❌ كلمة المرور غير صحيحة: `{e}`")
 
     elif state == "WAITING_TEMPLATE":
-        db["templates"].append(text)
+        # السماح بإضافة كليشات متعددة في سطر واحد، كل كليشة في سطر منفصل
+        lines = text.strip().split('\n')
+        for line in lines:
+            if line.strip():
+                db["templates"].append(line.strip())
         db["user_state"].pop(user_id_str, None)
         save_data(db)
-        return await message.reply_text("✅ تمت إضافة الكليشة!")
+        return await message.reply_text(f"✅ تمت إضافة {len(lines)} كليشة!")
 
     elif state == "WAITING_GROUP":
         group = clean_group_link(text.strip())
@@ -462,21 +522,31 @@ async def handle_menu(client: Client, message: Message):
     elif text in MENU_ACTIONS["delete_account"]:
         if not db["accounts"]:
             return await message.reply_text("❌ لا توجد حسابات لحذفها.")
-        db["accounts"].pop()
-        save_data(db)
-        await message.reply_text("🗑 تم حذف آخر حساب.")
+        
+        # عرض قائمة للحذف
+        keyboard = create_selection_list(db["accounts"], "account", "delete")
+        await message.reply_text(
+            "اختر الحساب لحذفه:",
+            reply_markup=keyboard
+        )
 
     elif text in MENU_ACTIONS["add_text"]:
         db["user_state"][user_id_str] = "WAITING_TEMPLATE"
         save_data(db)
-        await message.reply_text("📝 أرسل الكليشة الجديدة:")
+        await message.reply_text(
+            "📝 أرسل الكليشة الجديدة (يمكنك إرسال عدة كليشات، كل كليشة في سطر منفصل):"
+        )
 
     elif text in MENU_ACTIONS["delete_text"]:
         if not db["templates"]:
             return await message.reply_text("❌ لا توجد كليشات لحذفها.")
-        db["templates"].pop()
-        save_data(db)
-        await message.reply_text("🗑 تم حذف آخر كليشة.")
+        
+        # عرض قائمة للحذف
+        keyboard = create_selection_list(db["templates"], "template", "delete")
+        await message.reply_text(
+            "اختر الكليشة لحذفها:",
+            reply_markup=keyboard
+        )
 
     elif text in MENU_ACTIONS["add_group"]:
         db["user_state"][user_id_str] = "WAITING_GROUP"
@@ -486,9 +556,13 @@ async def handle_menu(client: Client, message: Message):
     elif text in MENU_ACTIONS["delete_group"]:
         if not db["groups"]:
             return await message.reply_text("❌ لا توجد كروبات لحذفها.")
-        db["groups"].pop()
-        save_data(db)
-        await message.reply_text("🗑 تم حذف آخر كروب.")
+        
+        # عرض قائمة للحذف
+        keyboard = create_selection_list(db["groups"], "group", "delete")
+        await message.reply_text(
+            "اختر الكروب لحذفه:",
+            reply_markup=keyboard
+        )
 
     elif text in MENU_ACTIONS["start"]:
         if db["is_running"]:
@@ -499,12 +573,15 @@ async def handle_menu(client: Client, message: Message):
         db["is_running"] = True
         save_data(db)
         asyncio.create_task(auto_posting_loop())
-        total = db.get('timer', 200) * len(db["accounts"])
+        timer_value = db.get('timer', 200)
+        total_cycle = timer_value * len(db["accounts"])
         await message.reply_text(
             f"🚀 تم تشغيل البوت!\n"
             f"📊 الحسابات: {len(db['accounts'])}\n"
-            f"⏱ المؤقت: {db.get('timer', 200)} ثانية\n"
-            f"⏰ دورة الحسابات: {total} ثانية"
+            f"⏱ المؤقت بين الحسابات: {timer_value} ثانية\n"
+            f"⏰ وقت دورة الحسابات الكاملة: {total_cycle} ثانية\n"
+            f"📝 عدد الكليشات: {len(db['templates'])}\n"
+            f"📢 عدد الكروبات: {len(db['groups'])}"
         )
 
     elif text in MENU_ACTIONS["stop"]:
@@ -518,20 +595,23 @@ async def handle_menu(client: Client, message: Message):
         db["user_state"][user_id_str] = "WAITING_TIMER"
         save_data(db)
         await message.reply_text(
-            f"⏱ المؤقت الحالي: {db.get('timer', 200)} ثانية\nأرسل القيمة الجديدة:"
+            f"⏱ المؤقت الحالي: {db.get('timer', 200)} ثانية\n"
+            f"أرسل القيمة الجديدة (بالثواني):\n"
+            f"ملاحظة: كل حساب سيرسل رسالة بعد مرور هذا الوقت على إرسال الحساب السابق"
         )
 
     elif text in MENU_ACTIONS["stats"]:
         status = "🟢 يعمل" if db["is_running"] else "🔴 متوقف"
-        total = db.get('timer', 200) * len(db["accounts"]) if db["accounts"] else 0
+        timer_value = db.get('timer', 200)
+        total_cycle = timer_value * len(db["accounts"]) if db["accounts"] else 0
         await message.reply_text(
             f"📊 الإحصائيات:\n\n"
             f"الحالة: {status}\n"
             f"الحسابات: {len(db['accounts'])}\n"
             f"الكليشات: {len(db['templates'])}\n"
             f"الكروبات: {len(db['groups'])}\n"
-            f"المؤقت: {db.get('timer', 200)} ثانية\n"
-            f"دورة الحسابات: {total} ثانية\n"
+            f"المؤقت بين الحسابات: {timer_value} ثانية\n"
+            f"وقت دورة الحسابات الكاملة: {total_cycle} ثانية\n"
             f"✅ تم الإرسال: {db['stats']['sent_count']}\n"
             f"❌ فشل الإرسال: {db['stats']['failed_count']}"
         )
