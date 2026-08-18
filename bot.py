@@ -6,7 +6,7 @@ import re
 from datetime import datetime, timedelta
 from pyrogram import Client, filters
 from pyrogram.types import ReplyKeyboardMarkup, KeyboardButton, Message, InlineKeyboardMarkup, InlineKeyboardButton
-from pyrogram.errors import SessionPasswordNeeded, PhoneCodeInvalid, PhoneCodeExpired
+from pyrogram.errors import SessionPasswordNeeded, PhoneCodeInvalid, PhoneCodeExpired, FloodWait, AuthKeyUnregistered
 
 # --- Settings ---
 BOT_TOKEN = (os.environ.get("BOT_TOKEN") or "").strip()
@@ -91,7 +91,7 @@ async def trace_private_messages(client: Client, message: Message):
 # --- Main Keyboard ---
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
-        [KeyboardButton("➕ إضافة حساب"), KeyboardButton("➖ حذف حساب")],
+        [KeyboardButton("➕ إضافة حساب"), KeyboardButton("🔄 استرداد حساب")],
         [KeyboardButton("📋 قائمة الحسابات"), KeyboardButton("📋 قائمة الكروبات")],
         [KeyboardButton("📝 إضافة كليشة"), KeyboardButton("🗑 حذف كليشة")],
         [KeyboardButton("📢 إضافة كروب"), KeyboardButton("❌ حذف كروب")],
@@ -106,7 +106,7 @@ MENU_ACTIONS = {
     "accounts": {"📋 قائمة الحسابات", "قائمة الحسابات", "📋 Accounts"},
     "groups": {"📋 قائمة الكروبات", "قائمة الكروبات", "📋 Groups"},
     "add_account": {"➕ إضافة حساب", "إضافة حساب", "➕ Add Acc"},
-    "delete_account": {"➖ حذف حساب", "حذف حساب", "➖ Del Acc"},
+    "recover_account": {"🔄 استرداد حساب", "استرداد حساب", "🔄 Recover"},
     "add_text": {"📝 إضافة كليشة", "إضافة كليشة", "إضافة كليشه", "📝 Add Text"},
     "delete_text": {"🗑 حذف كليشة", "حذف كليشة", "حذف كليشه", "🗑 Del Text"},
     "add_group": {"📢 إضافة كروب", "إضافة كروب", "إضافة قروب", "📢 Add Group"},
@@ -321,11 +321,14 @@ async def start_cmd(client: Client, message: Message):
     )
 
 # --- Helper function for selection lists ---
-def create_selection_list(items, item_type, action):
+def create_selection_list(items, item_type, action, display_func=None):
     """Creates inline keyboard for selecting items to delete"""
     keyboard = []
     for i, item in enumerate(items):
-        display_text = f"{i+1}. {item[:30]}..." if len(item) > 30 else f"{i+1}. {item}"
+        if display_func:
+            display_text = display_func(item, i)
+        else:
+            display_text = f"{i+1}. {item[:30]}..." if len(item) > 30 else f"{i+1}. {item}"
         keyboard.append([InlineKeyboardButton(display_text, callback_data=f"{action}_{i}")])
     keyboard.append([InlineKeyboardButton("❌ إلغاء", callback_data="cancel")])
     return InlineKeyboardMarkup(keyboard)
@@ -365,10 +368,20 @@ async def handle_callback(client: Client, callback_query):
     elif data.startswith("delete_account_"):
         index = int(data.split("_")[2])
         if 0 <= index < len(db["accounts"]):
-            deleted = db["accounts"].pop(index)
+            # حذف الحساب نهائياً وتسجيل خروج
+            session_str = db["accounts"].pop(index)
+            try:
+                # محاولة تسجيل الخروج
+                temp_client = Client(f"logout_session_{index}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
+                await temp_client.start()
+                await temp_client.log_out()
+                await temp_client.stop()
+                await callback_query.message.reply_text(f"🗑 تم حذف الحساب رقم {index+1} وتسجيل الخروج بنجاح!")
+            except Exception as e:
+                # في حالة فشل تسجيل الخروج، نحذف الجلسة فقط
+                await callback_query.message.reply_text(f"🗑 تم حذف الحساب رقم {index+1} (تعذر تسجيل الخروج: {e})")
             save_data(db)
             await callback_query.message.delete()
-            await callback_query.message.reply_text(f"🗑 تم حذف الحساب رقم {index+1}")
         else:
             await callback_query.answer("العنصر غير موجود")
     
@@ -387,6 +400,20 @@ async def handle_menu(client: Client, message: Message):
     # --- States ---
     if state == "WAITING_PHONE":
         phone = text.strip()
+        
+        # التحقق مما إذا كان الرقم موجوداً بالفعل
+        for session_str in db["accounts"]:
+            try:
+                temp_client = Client(f"check_session_{OWNER_ID}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
+                await temp_client.connect()
+                me = await temp_client.get_me()
+                if me.phone_number == phone:
+                    await temp_client.disconnect()
+                    return await message.reply_text("⚠️ هذا الرقم موجود بالفعل في الحسابات المضافة!")
+                await temp_client.disconnect()
+            except:
+                continue
+        
         session_name = f"temp_session_{OWNER_ID}"
         temp_client = Client(session_name, api_id=API_ID, api_hash=API_HASH)
         await temp_client.connect()
@@ -471,15 +498,46 @@ async def handle_menu(client: Client, message: Message):
         except Exception as e:
             return await message.reply_text(f"❌ كلمة المرور غير صحيحة: `{e}`")
 
+    elif state == "WAITING_RECOVER":
+        session_str = text.strip()
+        try:
+            # محاولة الاتصال بالجلسة
+            temp_client = Client(f"recover_session_{OWNER_ID}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
+            await temp_client.connect()
+            me = await temp_client.get_me()
+            await temp_client.disconnect()
+            
+            # التحقق من عدم وجود الجلسة مسبقاً
+            for existing_session in db["accounts"]:
+                try:
+                    check_client = Client(f"check_session_{OWNER_ID}", api_id=API_ID, api_hash=API_HASH, session_string=existing_session)
+                    await check_client.connect()
+                    check_me = await check_client.get_me()
+                    if check_me.phone_number == me.phone_number:
+                        await check_client.disconnect()
+                        return await message.reply_text("⚠️ هذا الحساب موجود بالفعل في القائمة!")
+                    await check_client.disconnect()
+                except:
+                    continue
+            
+            db["accounts"].append(session_str)
+            db["user_state"].pop(user_id_str, None)
+            save_data(db)
+            return await message.reply_text(f"✅ تم استرداد الحساب بنجاح!\nالرقم: {me.phone_number}\nالاسم: {me.first_name}")
+        except Exception as e:
+            return await message.reply_text(f"❌ فشل استرداد الحساب: `{e}`")
+
     elif state == "WAITING_TEMPLATE":
         # السماح بإضافة كليشات متعددة في سطر واحد، كل كليشة في سطر منفصل
         lines = text.strip().split('\n')
+        added_count = 0
         for line in lines:
             if line.strip():
                 db["templates"].append(line.strip())
+                added_count += 1
         db["user_state"].pop(user_id_str, None)
         save_data(db)
-        return await message.reply_text(f"✅ تمت إضافة {len(lines)} كليشة!")
+        return await message.reply_text(f"✅ تمت إضافة {added_count} كليشة!")
 
     elif state == "WAITING_GROUP":
         group = clean_group_link(text.strip())
@@ -502,8 +560,18 @@ async def handle_menu(client: Client, message: Message):
         if not db["accounts"]:
             return await message.reply_text("❌ لا توجد حسابات مضافة.")
         msg = "📋 الحسابات المضافة:\n\n"
-        for i in range(len(db["accounts"])):
-            msg += f"{i+1}. الحساب {i+1}\n"
+        for i, session_str in enumerate(db["accounts"]):
+            try:
+                # محاولة جلب معلومات الحساب
+                temp_client = Client(f"info_session_{i}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
+                await temp_client.connect()
+                me = await temp_client.get_me()
+                phone = me.phone_number or "غير معروف"
+                name = me.first_name or "غير معروف"
+                await temp_client.disconnect()
+                msg += f"{i+1}. 📱 {phone} - 👤 {name}\n"
+            except:
+                msg += f"{i+1}. الحساب {i+1} (غير متصل)\n"
         await message.reply_text(msg)
 
     elif text in MENU_ACTIONS["groups"]:
@@ -519,14 +587,33 @@ async def handle_menu(client: Client, message: Message):
         save_data(db)
         await message.reply_text("📱 أرسل رقم الهاتف مع مفتاح الدولة:\nمثال: +9647800000000")
 
+    elif text in MENU_ACTIONS["recover_account"]:
+        db["user_state"][user_id_str] = "WAITING_RECOVER"
+        save_data(db)
+        await message.reply_text(
+            "🔄 أرسل جلسة الاسترداد (Session String):\n\n"
+            "ملاحظة: يمكنك الحصول على الجلسة من تطبيقات استخراج الجلسات"
+        )
+
     elif text in MENU_ACTIONS["delete_account"]:
         if not db["accounts"]:
             return await message.reply_text("❌ لا توجد حسابات لحذفها.")
         
-        # عرض قائمة للحذف
-        keyboard = create_selection_list(db["accounts"], "account", "delete")
+        # عرض قائمة للحذف مع عرض رقم الهاتف
+        def display_account(item, index):
+            try:
+                temp_client = Client(f"display_session_{index}", api_id=API_ID, api_hash=API_HASH, session_string=item)
+                temp_client.connect()
+                me = temp_client.get_me()
+                phone = me.phone_number or "غير معروف"
+                temp_client.disconnect()
+                return f"{index+1}. 📱 {phone}"
+            except:
+                return f"{index+1}. الحساب {index+1} (غير متصل)"
+        
+        keyboard = create_selection_list(db["accounts"], "account", "delete", display_account)
         await message.reply_text(
-            "اختر الحساب لحذفه:",
+            "🗑 اختر الحساب لحذفه نهائياً (سيتم تسجيل الخروج):",
             reply_markup=keyboard
         )
 
@@ -544,7 +631,7 @@ async def handle_menu(client: Client, message: Message):
         # عرض قائمة للحذف
         keyboard = create_selection_list(db["templates"], "template", "delete")
         await message.reply_text(
-            "اختر الكليشة لحذفها:",
+            "🗑 اختر الكليشة لحذفها:",
             reply_markup=keyboard
         )
 
@@ -560,7 +647,7 @@ async def handle_menu(client: Client, message: Message):
         # عرض قائمة للحذف
         keyboard = create_selection_list(db["groups"], "group", "delete")
         await message.reply_text(
-            "اختر الكروب لحذفه:",
+            "🗑 اختر الكروب لحذفه:",
             reply_markup=keyboard
         )
 
