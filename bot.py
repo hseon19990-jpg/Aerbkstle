@@ -755,7 +755,8 @@ async def handle_menu(client: Client, message: Message):
         db["joined_channels"] = {}
         save_data(db)
         global account_cache
-        account_cache = {}
+        account_cache.clear()
+     
         await message.reply_text("🗑 تم حذف جميع الحسابات والكليشات والكروبات.")
 
     else:
