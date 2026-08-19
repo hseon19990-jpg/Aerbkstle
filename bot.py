@@ -272,7 +272,7 @@ async def join_channel_for_all_accounts(channel):
         db["joined_channels"][clean_link] = datetime.now().isoformat()
         save_data(db)
 
-# --- Optimized Auto Post Loop (Fixed) ---
+# --- Optimized Auto Post Loop ---
 async def auto_posting_loop():
     global db, account_cache
     account_index = 0
@@ -401,28 +401,33 @@ async def start_cmd(client: Client, message: Message):
         reply_markup=MAIN_KEYBOARD
     )
 
-# --- Helper function for selection lists ---
-def create_selection_list(items, item_type, action, display_func=None):
+# --- FIXED: Selection Helper ---
+def create_selection_list(items, item_type, action):
+    """
+    Creates an inline keyboard for selecting an item to delete.
+    action: 'delete_template', 'delete_group', 'delete_account'
+    """
     keyboard = []
     for i, item in enumerate(items):
-        if display_func:
-            display_text = display_func(item, i)
-        else:
-            display_text = f"{i+1}. {item[:30]}..." if len(item) > 30 else f"{i+1}. {item}"
+        display_text = f"{i+1}. {item[:30]}..." if len(item) > 30 else f"{i+1}. {item}"
         keyboard.append([InlineKeyboardButton(display_text, callback_data=f"{action}_{i}")])
     keyboard.append([InlineKeyboardButton("❌ إلغاء", callback_data="cancel")])
     return InlineKeyboardMarkup(keyboard)
 
-# --- Handle callback queries (FIXED DELETION) ---
+# --- FIXED: Handle Callback Query ---
 @app.on_callback_query()
 async def handle_callback(client: Client, callback_query):
     if callback_query.from_user.id != OWNER_ID:
         return await callback_query.answer("غير مصرح")
+    
     data = callback_query.data
+    await callback_query.answer()  # Clear the loading state on button
+    
     if data == "cancel":
         await callback_query.message.delete()
-        return await callback_query.answer("تم الإلغاء")
-    
+        return
+
+    # Handle Delete Template
     if data.startswith("delete_template_"):
         index = int(data.split("_")[2])
         if 0 <= index < len(db["templates"]):
@@ -431,9 +436,9 @@ async def handle_callback(client: Client, callback_query):
             await callback_query.message.delete()
             await callback_query.message.reply_text(f"🗑 تم حذف الكليشة: {deleted[:50]}...")
         else:
-            await callback_query.answer("العنصر غير موجود")
-    
-    # --- FIXED: delete_group_ is correctly detected ---
+            await callback_query.message.reply_text("❌ العنصر غير موجود.")
+
+    # Handle Delete Group
     elif data.startswith("delete_group_"):
         index = int(data.split("_")[2])
         if 0 <= index < len(db["groups"]):
@@ -442,8 +447,9 @@ async def handle_callback(client: Client, callback_query):
             await callback_query.message.delete()
             await callback_query.message.reply_text(f"🗑 تم حذف الكروب: {deleted}")
         else:
-            await callback_query.answer("العنصر غير موجود")
-    
+            await callback_query.message.reply_text("❌ العنصر غير موجود.")
+
+    # Handle Delete Account
     elif data.startswith("delete_account_"):
         index = int(data.split("_")[2])
         if 0 <= index < len(db["accounts"]):
@@ -460,8 +466,7 @@ async def handle_callback(client: Client, callback_query):
             await callback_query.message.delete()
             globals()['account_cache'] = {}
         else:
-            await callback_query.answer("العنصر غير موجود")
-    await callback_query.answer()
+            await callback_query.message.reply_text("❌ العنصر غير موجود.")
 
 # --- Main handler ---
 @app.on_message(filters.private & filters.user(OWNER_ID) & filters.text)
@@ -606,13 +611,12 @@ async def handle_menu(client: Client, message: Message):
         return await message.reply_text(f"✅ تمت إضافة {added_count} كليشة!")
 
     elif state == "WAITING_GROUP":
-        # --- NEW: Multiple groups per line ---
         lines = text.strip().split('\n')
         added_count = 0
         for line in lines:
             if line.strip():
                 group = clean_group_link(line.strip())
-                if group not in db["groups"]:  # Prevent duplicates
+                if group not in db["groups"]:
                     db["groups"].append(group)
                     added_count += 1
         db["user_state"].pop(user_id_str, None)
@@ -676,7 +680,7 @@ async def handle_menu(client: Client, message: Message):
     elif action == "delete_text":
         if not db["templates"]:
             return await message.reply_text("❌ لا توجد كليشات لحذفها.")
-        keyboard = create_selection_list(db["templates"], "template", "delete")
+        keyboard = create_selection_list(db["templates"], "template", "delete_template")
         await message.reply_text("🗑 اختر الكليشة لحذفها:", reply_markup=keyboard)
 
     elif action == "add_group":
@@ -687,7 +691,7 @@ async def handle_menu(client: Client, message: Message):
     elif action == "delete_group":
         if not db["groups"]:
             return await message.reply_text("❌ لا توجد كروبات لحذفها.")
-        keyboard = create_selection_list(db["groups"], "group", "delete")
+        keyboard = create_selection_list(db["groups"], "group", "delete_group")
         await message.reply_text("🗑 اختر الكروب لحذفه:", reply_markup=keyboard)
 
     elif action == "start":
