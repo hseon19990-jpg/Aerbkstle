@@ -306,10 +306,6 @@ async def auto_posting_loop():
                     if not db["is_running"]:
                         break
 
-                    # Skip check disabled to allow sending
-                    # if group in db.get("last_message", {}) and db["last_message"][group].get("from_our_account", False):
-                    #     continue
-
                     template = random.choice(db["templates"])
 
                     try:
@@ -417,7 +413,7 @@ def create_selection_list(items, item_type, action, display_func=None):
     keyboard.append([InlineKeyboardButton("❌ إلغاء", callback_data="cancel")])
     return InlineKeyboardMarkup(keyboard)
 
-# --- Handle callback queries ---
+# --- Handle callback queries (FIXED DELETION) ---
 @app.on_callback_query()
 async def handle_callback(client: Client, callback_query):
     if callback_query.from_user.id != OWNER_ID:
@@ -437,6 +433,7 @@ async def handle_callback(client: Client, callback_query):
         else:
             await callback_query.answer("العنصر غير موجود")
     
+    # --- FIXED: delete_group_ is correctly detected ---
     elif data.startswith("delete_group_"):
         index = int(data.split("_")[2])
         if 0 <= index < len(db["groups"]):
