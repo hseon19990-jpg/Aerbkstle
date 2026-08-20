@@ -6,7 +6,10 @@ import re
 from datetime import datetime, timedelta
 from pyrogram import Client, filters
 from pyrogram.types import ReplyKeyboardMarkup, KeyboardButton, Message, InlineKeyboardMarkup, InlineKeyboardButton
-from pyrogram.errors import SessionPasswordNeeded, PhoneCodeInvalid, PhoneCodeExpired, FloodWait, AuthKeyUnregistered
+from pyrogram.errors import (
+    SessionPasswordNeeded, PhoneCodeInvalid, PhoneCodeExpired, 
+    FloodWait, AuthKeyUnregistered, PeerIdInvalid, UserBannedInChannel
+)
 
 # --- Settings ---
 BOT_TOKEN = (os.environ.get("BOT_TOKEN") or "").strip()
@@ -38,6 +41,7 @@ login_sessions = {}
 account_cache = {}
 posting_task = None
 auto_leave_task = None
+account_status = {}  # تتبع حالة كل حساب
 
 # --- Load/Save Data ---
 def load_data():
@@ -53,7 +57,8 @@ def load_data():
             "last_message": {},
             "outgoing_messages": {},
             "joined_channels": {},
-            "channel_join_time": {}  # لتتبع وقت الانضمام
+            "channel_join_time": {},
+            "account_errors": {}  # تخزين أخطاء الحسابات
         }
         os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
         with open(DATA_FILE, "w", encoding="utf-8") as f:
@@ -80,6 +85,7 @@ db.setdefault("last_message", {})
 db.setdefault("outgoing_messages", {})
 db.setdefault("joined_channels", {})
 db.setdefault("channel_join_time", {})
+db.setdefault("account_errors", {})
 
 # --- Bot Client ---
 app = Client("auto_post_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
@@ -181,154 +187,46 @@ async def get_account_info(session_str, index):
         temp_client = Client(f"info_session_{index}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
         await temp_client.connect()
         me = await temp_client.get_me()
-        info = {"phone": me.phone_number or "غير معروف", "name": me.first_name or "غير معروف", "connected": True}
+        info = {
+            "phone": me.phone_number or "غير معروف", 
+            "name": me.first_name or "غير معروف", 
+            "connected": True,
+            "id": me.id
+        }
         await temp_client.disconnect()
         account_cache[cache_key] = info
         return info
     except:
-        info = {"phone": "غير معروف", "name": "غير متصل", "connected": False}
+        info = {"phone": "غير معروف", "name": "غير متصل", "connected": False, "id": None}
         account_cache[cache_key] = info
         return info
 
-# --- 🔥 NEW: Random delay distribution ---
-def get_random_delays(timer_value, num_accounts):
-    """
-    توزيع عشوائي للتأخيرات بين الحسابات
-    مثلاً: timer=60, 5 حسابات → [0, 12, 25, 40, 55] (أرقام عشوائية)
-    """
-    if num_accounts <= 0:
-        return []
-    
-    # توليد نقاط عشوائية موزعة على timer_value ثانية
-    delays = sorted(random.sample(range(1, timer_value), min(num_accounts, timer_value - 1)))
-    
-    # إذا كان عدد الحسابات أكبر من timer_value، نضيف تأخيرات إضافية
-    while len(delays) < num_accounts:
-        delays.append(random.randint(1, timer_value - 1))
-        delays.sort()
-    
-    return delays[:num_accounts]
-
-# --- 🚀 NEW: Optimized Auto Post Loop with Random Distribution ---
-async def auto_posting_loop():
-    global db, account_cache
-    active_clients = []
-    account_delays = []  # تأخيرات عشوائية لكل حساب
-
+# --- 🔥 NEW: Account Status Check ---
+async def check_account_status(client, account_number):
+    """التحقق من حالة الحساب وإرسال إشعارات"""
     try:
-        # Connect accounts
-        for idx, session_str in enumerate(db["accounts"]):
-            try:
-                client = Client(f"active_session_{idx}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
-                await client.start()
-                active_clients.append(client)
-                print(f"✅ Account {idx+1} connected")
-            except Exception as e:
-                print(f"❌ Failed to connect account {idx+1}: {e}")
-                active_clients.append(None)
+        me = await client.get_me()
+        return {"status": "active", "message": f"✅ الحساب {account_number} يعمل بشكل طبيعي"}
+    except FloodWait as e:
+        wait_time = e.x
+        error_msg = f"⏳ الحساب {account_number} ممنوع مؤقتاً لمدة {wait_time} ثانية"
+        print(f"⚠️ {error_msg}")
+        await notify_owner(error_msg)
+        return {"status": "flood", "message": error_msg, "wait": wait_time}
+    except Exception as e:
+        error_msg = f"❌ الحساب {account_number} عالق أو محظور: {str(e)[:50]}"
+        print(f"⚠️ {error_msg}")
+        await notify_owner(error_msg)
+        return {"status": "error", "message": error_msg}
 
-        # حساب التوزيع العشوائي
-        timer_value = max(2, int(db.get("timer", 60)))  # الحد الأدنى 2 ثانية
-        num_accounts = len([c for c in active_clients if c is not None])
-        
-        if num_accounts == 0:
-            print("❌ No active accounts!")
-            db["is_running"] = False
-            save_data(db)
-            return
+async def notify_owner(message):
+    """إرسال إشعار للمالك"""
+    try:
+        await app.send_message(OWNER_ID, f"⚠️ تنبيه البوت:\n{message}")
+    except:
+        print(f"⚠️ فشل إرسال إشعار للمالك: {message}")
 
-        # توليد تأخيرات عشوائية
-        account_delays = get_random_delays(timer_value, num_accounts)
-        print(f"⏱ Random delays: {account_delays}")
-
-        # دورة البريد العشوائية
-        cycle_count = 0
-        while db["is_running"]:
-            if not db["accounts"] or not db["templates"] or not db["groups"]:
-                db["is_running"] = False
-                save_data(db)
-                break
-
-            # خلط الحسابات لكل دورة (توزيع عشوائي)
-            account_indices = list(range(len(active_clients)))
-            random.shuffle(account_indices)
-            
-            # خلط المجموعات لكل دورة
-            shuffled_groups = db["groups"].copy()
-            random.shuffle(shuffled_groups)
-
-            print(f"\n🔄 Cycle {cycle_count + 1} started with random distribution")
-
-            # إرسال كل حساب مع تأخيره العشوائي
-            for acc_idx, account_position in enumerate(account_indices):
-                if not db["is_running"]:
-                    break
-
-                current_client = active_clients[account_position]
-                if current_client is None:
-                    continue
-
-                account_number = account_position + 1
-                groups_to_remove = []
-
-                # تأخير عشوائي لهذا الحساب (بالنسبة لبداية الدورة)
-                delay = account_delays[acc_idx % len(account_delays)]
-                print(f"⏱ Acc {account_number} waiting {delay}s before sending...")
-                await asyncio.sleep(delay)
-
-                # إرسال لكل المجموعات (مع خلط عشوائي)
-                for group in shuffled_groups:
-                    if not db["is_running"]:
-                        break
-
-                    template = random.choice(db["templates"])
-
-                    try:
-                        sent_msg = await current_client.send_message(group, template)
-                        db["stats"]["sent_count"] += 1
-                        save_data(db)
-                        print(f"✅ Acc {account_number} sent to {group}")
-                    except Exception as e:
-                        db["stats"]["failed_count"] += 1
-                        save_data(db)
-                        print(f"❌ Acc {account_number} failed to {group}: {e}")
-                        
-                        # Auto-remove invalid groups
-                        if "USERNAME_INVALID" in str(e) or "PEER_ID_INVALID" in str(e) or "ID not found" in str(e):
-                            print(f"⚠️ Marking invalid group for removal: {group}")
-                            groups_to_remove.append(group)
-
-                    # انتظار قصير بين الرسائل لنفس الحساب
-                    await asyncio.sleep(random.uniform(1, 3))
-
-                # حذف المجموعات التالفة
-                if groups_to_remove:
-                    for bad_group in groups_to_remove:
-                        if bad_group in db["groups"]:
-                            db["groups"].remove(bad_group)
-                    save_data(db)
-                    print(f"🧹 Removed {len(groups_to_remove)} invalid group(s)")
-
-                # إعادة توليد التأخيرات العشوائية كل دورة
-                if acc_idx == len(account_indices) - 1:
-                    account_delays = get_random_delays(timer_value, num_accounts)
-                    print(f"🔄 New random delays for next cycle: {account_delays}")
-
-            cycle_count += 1
-            print(f"⏱ Cycle {cycle_count} completed, waiting for timer reset...")
-
-            # انتظار المؤقت كاملاً قبل الدورة التالية
-            await asyncio.sleep(timer_value)
-
-    finally:
-        for client in active_clients:
-            if client:
-                try:
-                    await client.stop()
-                except:
-                    pass
-
-# --- 🔥 NEW: Auto Join Channels (12 hours instead of 24) ---
+# --- Auto Leave Channels (12 hours) ---
 async def auto_leave_channels():
     global db
     while True:
@@ -336,11 +234,10 @@ async def auto_leave_channels():
             now = datetime.now()
             to_remove = []
             
-            # التحقق من القنوات التي مضى عليها أكثر من 12 ساعة
             for channel, join_time in db.get("joined_channels", {}).items():
                 try:
                     join_dt = datetime.fromisoformat(join_time)
-                    if now - join_dt > timedelta(hours=12):  # 🟢 تغيير إلى 12 ساعة
+                    if now - join_dt > timedelta(hours=12):
                         to_remove.append(channel)
                 except:
                     to_remove.append(channel)
@@ -364,13 +261,12 @@ async def auto_leave_channels():
                             except Exception:
                                 pass
                 
-                # إذا نجح جميع الحسابات في المغادرة، نحذف القناة من القائمة
                 if success:
                     db["joined_channels"].pop(channel, None)
                     db["channel_join_time"].pop(channel, None)
                     save_data(db)
                     
-            await asyncio.sleep(3600)  # التحقق كل ساعة
+            await asyncio.sleep(3600)
             
         except Exception as e:
             print(f"❌ Auto leave error: {e}")
@@ -381,13 +277,12 @@ def ensure_auto_leave_task():
     if auto_leave_task is None or auto_leave_task.done():
         auto_leave_task = asyncio.create_task(auto_leave_channels())
 
-# --- 🔥 NEW: Join channel for all accounts (with 12h tracking) ---
+# --- Join channel for all accounts ---
 async def join_channel_for_all_accounts(channel):
     clean_link = clean_group_link(channel)
     if not clean_link:
         return
     
-    # التحقق من أن القناة مسجلة بالفعل
     if clean_link in db.get("joined_channels", {}):
         print(f"⏭️ Already tracking {clean_link}")
         return
@@ -424,7 +319,6 @@ async def join_channel_for_all_accounts(channel):
                 except Exception:
                     pass
     
-    # إذا انضم حساب واحد على الأقل، نسجل القناة
     if joined_any:
         join_time = datetime.now().isoformat()
         db["joined_channels"][clean_link] = join_time
@@ -432,23 +326,221 @@ async def join_channel_for_all_accounts(channel):
         save_data(db)
         print(f"✅ Channel {clean_link} registered for auto-leave in 12 hours")
 
-# --- 🔥 NEW: Handle deleted messages (for mandatory channel join) ---
+# --- 🚀 MAIN POSTING LOOP WITH PROPER SCHEDULING ---
+async def auto_posting_loop():
+    global db, account_cache, account_status
+    active_clients = []
+    account_info = []
+    
+    try:
+        # Connect accounts and get info
+        for idx, session_str in enumerate(db["accounts"]):
+            try:
+                client = Client(f"active_session_{idx}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
+                await client.start()
+                
+                # التحقق من حالة الحساب
+                me = await client.get_me()
+                active_clients.append(client)
+                account_info.append({
+                    "index": idx,
+                    "number": idx + 1,
+                    "phone": me.phone_number,
+                    "name": me.first_name,
+                    "client": client
+                })
+                print(f"✅ Account {idx+1} connected: {me.phone_number}")
+                
+            except FloodWait as e:
+                error_msg = f"⏳ الحساب {idx+1} ممنوع مؤقتاً لمدة {e.x} ثانية"
+                print(f"⚠️ {error_msg}")
+                await notify_owner(error_msg)
+                active_clients.append(None)
+                account_info.append({"index": idx, "number": idx+1, "status": "flood", "error": str(e)})
+                
+            except Exception as e:
+                error_msg = f"❌ فشل اتصال الحساب {idx+1}: {str(e)[:50]}"
+                print(f"⚠️ {error_msg}")
+                await notify_owner(error_msg)
+                active_clients.append(None)
+                account_info.append({"index": idx, "number": idx+1, "status": "error", "error": str(e)})
+
+        timer_value = max(5, int(db.get("timer", 60)))
+        valid_accounts = [info for info in account_info if info.get("client") is not None]
+        
+        if not valid_accounts:
+            error_msg = "❌ لا يوجد حسابات نشطة! إيقاف البوت."
+            print(error_msg)
+            await notify_owner(error_msg)
+            db["is_running"] = False
+            save_data(db)
+            return
+
+        print(f"🚀 Starting with {len(valid_accounts)} active accounts, timer: {timer_value}s")
+        await notify_owner(f"🚀 بدء تشغيل البوت\n📊 {len(valid_accounts)} حساب نشط\n⏱ {timer_value} ثانية")
+
+        # 🔥 كل حساب يعمل في مهمة مستقلة
+        async def account_worker(acc_info):
+            """كل حساب يعمل في مهمة مستقلة"""
+            if acc_info.get("client") is None:
+                return
+            
+            client = acc_info["client"]
+            acc_number = acc_info["number"]
+            
+            # التأخير الأولي (0, 1, 2, 3, ...)
+            initial_delay = acc_info["index"]
+            await asyncio.sleep(initial_delay)
+            
+            print(f"🔄 Account {acc_number} started with delay {initial_delay}s")
+            
+            cycle = 0
+            consecutive_errors = 0
+            max_errors = 5  # حد الأخطاء المتتالية
+            
+            while db["is_running"]:
+                if not db["accounts"] or not db["templates"] or not db["groups"]:
+                    db["is_running"] = False
+                    save_data(db)
+                    break
+                
+                try:
+                    # التحقق من حالة الحساب قبل الإرسال
+                    status = await check_account_status(client, acc_number)
+                    if status["status"] != "active":
+                        if status["status"] == "flood":
+                            wait_time = status.get("wait", 60)
+                            print(f"⏳ Acc {acc_number} flood wait {wait_time}s")
+                            await asyncio.sleep(wait_time)
+                            continue
+                        else:
+                            # حساب عالق أو محظور
+                            consecutive_errors += 1
+                            if consecutive_errors >= max_errors:
+                                error_msg = f"🚨 الحساب {acc_number} عالق/محظور! تم إيقاف نشاطه."
+                                print(f"❌ {error_msg}")
+                                await notify_owner(error_msg)
+                                break
+                            await asyncio.sleep(30)
+                            continue
+                    
+                    # إعادة تعيين عدد الأخطاء عند النجاح
+                    consecutive_errors = 0
+                    
+                    # خلط المجموعات عشوائياً
+                    shuffled_groups = db["groups"].copy()
+                    random.shuffle(shuffled_groups)
+                    
+                    sent_count = 0
+                    failed_count = 0
+                    
+                    # الإرسال لكل المجموعات
+                    for group in shuffled_groups:
+                        if not db["is_running"]:
+                            break
+                        
+                        template = random.choice(db["templates"])
+                        
+                        try:
+                            await client.send_message(group, template)
+                            db["stats"]["sent_count"] += 1
+                            sent_count += 1
+                            save_data(db)
+                            print(f"✅ Acc {acc_number} sent to {group}")
+                            
+                            # انتظار بين الرسائل
+                            await asyncio.sleep(random.uniform(2, 5))
+                            
+                        except FloodWait as e:
+                            db["stats"]["failed_count"] += 1
+                            failed_count += 1
+                            save_data(db)
+                            error_msg = f"⏳ Acc {acc_number} flood wait {e.x}s on {group}"
+                            print(f"⚠️ {error_msg}")
+                            await notify_owner(error_msg)
+                            await asyncio.sleep(e.x)
+                            
+                        except UserBannedInChannel:
+                            db["stats"]["failed_count"] += 1
+                            failed_count += 1
+                            save_data(db)
+                            error_msg = f"🚫 الحساب {acc_number} ممنوع في {group}"
+                            print(f"❌ {error_msg}")
+                            await notify_owner(error_msg)
+                            if group in db["groups"]:
+                                db["groups"].remove(group)
+                                save_data(db)
+                                
+                        except Exception as e:
+                            db["stats"]["failed_count"] += 1
+                            failed_count += 1
+                            save_data(db)
+                            error_text = str(e)
+                            print(f"❌ Acc {acc_number} failed to {group}: {error_text}")
+                            
+                            # حذف المجموعات التالفة
+                            if "USERNAME_INVALID" in error_text or "PEER_ID_INVALID" in error_text:
+                                if group in db["groups"]:
+                                    db["groups"].remove(group)
+                                    save_data(db)
+                                    print(f"🧹 Removed invalid group: {group}")
+                    
+                    # إحصائيات الدورة
+                    if sent_count > 0 or failed_count > 0:
+                        status_msg = f"📊 Acc {acc_number} cycle {cycle+1}: ✅{sent_count} ❌{failed_count}"
+                        print(f"ℹ️ {status_msg}")
+                    
+                    # انتظار المؤقت الكامل
+                    print(f"⏱ Acc {acc_number} cycle {cycle+1} done, waiting {timer_value}s...")
+                    await asyncio.sleep(timer_value)
+                    cycle += 1
+                    
+                except Exception as e:
+                    error_msg = f"⚠️ خطأ في الحساب {acc_number}: {str(e)[:50]}"
+                    print(f"❌ {error_msg}")
+                    consecutive_errors += 1
+                    
+                    if consecutive_errors >= max_errors:
+                        await notify_owner(f"🚨 الحساب {acc_number} عالق! تم إيقاف نشاطه.")
+                        break
+                    
+                    await asyncio.sleep(30)
+        
+        # 🔥 تشغيل كل حساب في مهمة مستقلة
+        tasks = []
+        for acc_info in account_info:
+            if acc_info.get("client") is not None:
+                task = asyncio.create_task(account_worker(acc_info))
+                tasks.append(task)
+        
+        # انتظار انتهاء المهام
+        await asyncio.gather(*tasks, return_exceptions=True)
+        
+    except Exception as e:
+        error_msg = f"❌ خطأ رئيسي في حلقة النشر: {str(e)}"
+        print(f"❌ {error_msg}")
+        await notify_owner(error_msg)
+    finally:
+        for client in active_clients:
+            if client:
+                try:
+                    await client.stop()
+                except:
+                    pass
+        
+        if db["is_running"]:
+            db["is_running"] = False
+            save_data(db)
+            await notify_owner("🛑 تم إيقاف البوت تلقائياً بسبب خطأ")
+
+# --- Handle deleted messages ---
 @app.on_message(filters.group & filters.incoming)
 async def handle_deleted_messages(client: Client, message: Message):
-    """
-    عندما يتم حذف رسالة من أحد حساباتنا، ننتظر الرد من البوت
-    """
     if not message.from_user:
         return
     
-    # تخزين معرف الرسالة المرسلة من حسابنا
     chat_id = str(message.chat.id)
     
-    # نتحقق إذا كانت الرسالة من أحد حساباتنا (من خلال معرف المستخدم)
-    # نبحث في الحسابات المخزنة
-    message_key = f"{chat_id}:{message.id}"
-    
-    # نخزن معرف الرسالة المرسلة لتتبع الردود
     if chat_id not in db["outgoing_messages"]:
         db["outgoing_messages"][chat_id] = {}
     
@@ -458,12 +550,9 @@ async def handle_deleted_messages(client: Client, message: Message):
     }
     save_data(db)
 
-# --- 🔥 NEW: Handle bot replies to deleted messages ---
+# --- Handle bot replies ---
 @app.on_message(filters.group & filters.incoming, group=1)
 async def handle_replies_to_deleted(client: Client, message: Message):
-    """
-    عندما يرد البوت على رسالة محذوفة، نستخرج القناة الإجبارية
-    """
     if not message.from_user or not message.from_user.is_bot:
         return
     
@@ -471,11 +560,8 @@ async def handle_replies_to_deleted(client: Client, message: Message):
     if not replied_message or not replied_message.from_user:
         return
     
-    # التحقق من أن الرسالة الأصلية كانت من أحد حساباتنا
     chat_id = str(message.chat.id)
-    outgoing_key = f"{chat_id}:{replied_message.id}"
     
-    # نبحث في الرسائل المرسلة
     is_our_message = False
     if chat_id in db.get("outgoing_messages", {}):
         if replied_message.id in db["outgoing_messages"][chat_id]:
@@ -486,17 +572,14 @@ async def handle_replies_to_deleted(client: Client, message: Message):
     
     print(f"🤖 Bot replied to our deleted message in {chat_id}")
     
-    # استخراج الروابط من رد البوت
     links = extract_links(message.text or message.caption or "")
     
-    # استخراج الأزرار أيضاً (قد تكون القناة داخل زر)
     if message.reply_markup:
         for row in message.reply_markup.inline_keyboard:
             for button in row:
                 if button.url:
                     links.append(button.url)
                 elif button.text and ("قناة" in button.text or "channel" in button.text.lower()):
-                    # قد يكون النص يحتوي على رابط
                     extracted = extract_links(button.text)
                     links.extend(extracted)
     
@@ -506,7 +589,6 @@ async def handle_replies_to_deleted(client: Client, message: Message):
     
     print(f"📢 Found {len(links)} channel(s) to join")
     
-    # الانضمام لكل القنوات المكتشفة
     for link in links:
         await join_channel_for_all_accounts(link)
 
@@ -769,7 +851,8 @@ async def handle_menu(client: Client, message: Message):
         msg = "📋 الحسابات المضافة:\n\n"
         for i, session_str in enumerate(db["accounts"]):
             info = await get_account_info(session_str, i)
-            msg += f"{i+1}. {'✅' if info['connected'] else '❌'} 📱 {info['phone']} - 👤 {info['name']}\n"
+            status = "✅" if info['connected'] else "❌"
+            msg += f"{i+1}. {status} 📱 {info['phone']} - 👤 {info['name']}\n"
         await message.reply_text(msg)
 
     elif action == "groups":
@@ -840,7 +923,8 @@ async def handle_menu(client: Client, message: Message):
             f"📊 الحسابات: {len(db['accounts'])}\n"
             f"📢 الكروبات: {len(db['groups'])}\n"
             f"📝 الكليشات: {len(db['templates'])}\n"
-            f"🔄 توزيع عشوائي للحسابات والجروبات"
+            f"🔄 توزيع عشوائي للحسابات والجروبات\n"
+            f"📡 مراقبة الحظر والتجميد مفعلة"
         )
 
     elif action == "stop":
@@ -883,6 +967,7 @@ async def handle_menu(client: Client, message: Message):
         db["is_running"] = False
         db["joined_channels"] = {}
         db["channel_join_time"] = {}
+        db["account_errors"] = {}
         save_data(db)
         globals()['account_cache'] = {}
         await message.reply_text("🗑 تم حذف جميع الحسابات والكليشات والكروبات والقنوات الإجبارية.")
@@ -895,8 +980,10 @@ if __name__ == "__main__":
     print(f"👤 Owner: {OWNER_ID}")
     print(f"📊 Data: {DATA_FILE}")
     print("✨ Features:")
-    print("  🔄 Random account distribution")
-    print("  🎲 Random group shuffling")
+    print("  🔄 Proper account scheduling (each account has its own timer)")
+    print("  🎲 Random group shuffling per account")
     print("  📡 Auto-join mandatory channels")
     print("  ⏰ Auto-leave after 12 hours")
+    print("  🛡️ Account ban/freeze monitoring")
+    print("  📨 Instant notifications for errors")
     app.run()
