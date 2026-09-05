@@ -547,55 +547,20 @@ async def auto_posting_loop():
             save_data(db)
             await notify_owner("🛑 تم إيقاف البوت تلقائياً بسبب خطأ")
 
-# --- IMPROVED: Handle bot replies / mentions / tags on our messages ---
+# --- ✅ NEW: Handle ANY bot message with channel links in groups ---
 @app.on_message(filters.group & filters.incoming)
-async def handle_bot_replies_and_mentions(client: Client, message: Message):
-    # Check if the message is from a bot (any bot)
+async def handle_bot_messages_with_links(client: Client, message: Message):
+    # 1. Must be from a bot
     if not message.from_user or not message.from_user.is_bot:
         return
 
-    # Build a set of our accounts' usernames and IDs to detect mentions
-    our_usernames = set()
-    our_ids = set()
-    for idx, session_str in enumerate(db["accounts"]):
-        info = await get_account_info(session_str, idx)
-        if info.get("username"):
-            our_usernames.add(f"@{info['username'].lower()}")
-        if info.get("id"):
-            our_ids.add(info["id"])
-
-    is_related = False
-    # Case 1: Reply to our message
-    replied = message.reply_to_message
-    if replied and replied.from_user and replied.from_user.id in our_ids:
-        is_related = True
-    # Case 2: Mention/tag one of our accounts in the text
-    if not is_related and message.text:
-        text_lower = message.text.lower()
-        for uname in our_usernames:
-            if uname in text_lower:
-                is_related = True
-                break
-    # Case 3: Mention via entities (e.g., @username)
-    if not is_related and message.entities:
-        for entity in message.entities:
-            if entity.type == "mention" and entity.user and entity.user.id in our_ids:
-                is_related = True
-                break
-            if entity.type == "text_mention" and entity.user and entity.user.id in our_ids:
-                is_related = True
-                break
-
-    if not is_related:
-        return
-
-    # Now extract ALL links (text + inline buttons)
+    # 2. Extract ALL links from the bot message (text + inline buttons)
     links = extract_all_links(message)
     if not links:
-        print("⚠️ Bot message related to our accounts but no links found.")
-        return
+        return  # لا توجد روابط قنوات -> تجاهل
 
-    print(f"📢 Found {len(links)} channel(s) in bot message. Joining...")
+    # 3. Join all accounts to the extracted channels
+    print(f"🤖 Bot '{message.from_user.username}' sent a message with {len(links)} channel link(s). Joining...")
     for link in links:
         await join_channel_for_all_accounts(link)
 
@@ -1172,7 +1137,7 @@ if __name__ == "__main__":
     print("  🔄 Sequential posting system")
     print("  🎯 Template rotation (1, 2, 3...)")
     print("  🔄 Group rotation for each account")
-    print("  📡 Auto-join channels from any bot reply/mention")
+    print("  📡 Auto-join channels from ANY bot message")
     print("  ⏰ Auto-leave after 24 hours")
     print("  👥 Reply forwarding to owner")
     print("  💬 Owner reply system")
