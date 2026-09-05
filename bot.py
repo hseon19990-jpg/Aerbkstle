@@ -159,19 +159,40 @@ def get_menu_action(text):
             return action
     return None
 
-# --- Extract channel references from text ---
-def extract_links(text):
+# --- Extract ALL links from text and inline buttons ---
+def extract_all_links(message: Message):
+    links = []
+    seen = set()
+    
+    # 1. Extract from text or caption
+    text = (message.text or message.caption or "")
     pattern = (
         r'(?:https?://)?t\.me/(?:\+[\w-]+|joinchat/[\w-]+|[A-Za-z0-9_]+)'
         r'|@[A-Za-z0-9_]{4,}'
         r'|(?<!\d)-100\d{6,}'
     )
-    links = []
-    seen = set()
-    for match in re.findall(pattern, text or "", flags=re.IGNORECASE):
+    for match in re.findall(pattern, text, flags=re.IGNORECASE):
         if match not in seen:
             links.append(match)
             seen.add(match)
+    
+    # 2. Extract from inline keyboard buttons (all rows, all buttons)
+    if message.reply_markup:
+        for row in message.reply_markup.inline_keyboard:
+            for button in row:
+                # Check button.url
+                if button.url:
+                    clean = button.url.strip()
+                    if clean not in seen:
+                        links.append(clean)
+                        seen.add(clean)
+                # Check button.text for links (e.g., "قناة: @channel")
+                if button.text:
+                    for match in re.findall(pattern, button.text, flags=re.IGNORECASE):
+                        if match not in seen:
+                            links.append(match)
+                            seen.add(match)
+    
     return links
 
 # --- Clean group link ---
@@ -231,13 +252,14 @@ async def get_account_info(session_str, index):
             "phone": me.phone_number or "غير معروف", 
             "name": me.first_name or "غير معروف", 
             "connected": True,
-            "id": me.id
+            "id": me.id,
+            "username": me.username or ""
         }
         await temp_client.disconnect()
         account_cache[cache_key] = info
         return info
     except:
-        info = {"phone": "غير معروف", "name": "غير متصل", "connected": False, "id": None}
+        info = {"phone": "غير معروف", "name": "غير متصل", "connected": False, "id": None, "username": ""}
         account_cache[cache_key] = info
         return info
 
@@ -266,7 +288,7 @@ async def notify_owner(message):
     except:
         print(f"⚠️ فشل إرسال إشعار للمالك: {message}")
 
-# --- Auto Leave Channels (12 hours) ---
+# --- Auto Leave Channels (24 hours) ---
 async def auto_leave_channels():
     global db
     while True:
@@ -277,7 +299,7 @@ async def auto_leave_channels():
             for channel, join_time in db.get("joined_channels", {}).items():
                 try:
                     join_dt = datetime.fromisoformat(join_time)
-                    if now - join_dt > timedelta(hours=12):
+                    if now - join_dt > timedelta(hours=24):
                         to_remove.append(channel)
                 except:
                     to_remove.append(channel)
@@ -364,7 +386,7 @@ async def join_channel_for_all_accounts(channel):
         db["joined_channels"][clean_link] = join_time
         db["channel_join_time"][clean_link] = join_time
         save_data(db)
-        print(f"✅ Channel {clean_link} registered for auto-leave in 12 hours")
+        print(f"✅ Channel {clean_link} registered for auto-leave in 24 hours")
 
 # --- 🚀 MAIN POSTING LOOP ---
 async def auto_posting_loop():
@@ -525,45 +547,55 @@ async def auto_posting_loop():
             save_data(db)
             await notify_owner("🛑 تم إيقاف البوت تلقائياً بسبب خطأ")
 
-# --- Handle bot replies (auto-join channels) ---
-@app.on_message(filters.group & filters.incoming, group=1)
-async def handle_replies_to_deleted(client: Client, message: Message):
+# --- IMPROVED: Handle bot replies / mentions / tags on our messages ---
+@app.on_message(filters.group & filters.incoming)
+async def handle_bot_replies_and_mentions(client: Client, message: Message):
+    # Check if the message is from a bot (any bot)
     if not message.from_user or not message.from_user.is_bot:
         return
-    
-    replied_message = message.reply_to_message
-    if not replied_message or not replied_message.from_user:
+
+    # Build a set of our accounts' usernames and IDs to detect mentions
+    our_usernames = set()
+    our_ids = set()
+    for idx, session_str in enumerate(db["accounts"]):
+        info = await get_account_info(session_str, idx)
+        if info.get("username"):
+            our_usernames.add(f"@{info['username'].lower()}")
+        if info.get("id"):
+            our_ids.add(info["id"])
+
+    is_related = False
+    # Case 1: Reply to our message
+    replied = message.reply_to_message
+    if replied and replied.from_user and replied.from_user.id in our_ids:
+        is_related = True
+    # Case 2: Mention/tag one of our accounts in the text
+    if not is_related and message.text:
+        text_lower = message.text.lower()
+        for uname in our_usernames:
+            if uname in text_lower:
+                is_related = True
+                break
+    # Case 3: Mention via entities (e.g., @username)
+    if not is_related and message.entities:
+        for entity in message.entities:
+            if entity.type == "mention" and entity.user and entity.user.id in our_ids:
+                is_related = True
+                break
+            if entity.type == "text_mention" and entity.user and entity.user.id in our_ids:
+                is_related = True
+                break
+
+    if not is_related:
         return
-    
-    chat_id = str(message.chat.id)
-    
-    is_our_message = False
-    if chat_id in db.get("outgoing_messages", {}):
-        if replied_message.id in db["outgoing_messages"][chat_id]:
-            is_our_message = True
-    
-    if not is_our_message:
-        return
-    
-    print(f"🤖 Bot replied to our message in {chat_id}")
-    
-    links = extract_links(message.text or message.caption or "")
-    
-    if message.reply_markup:
-        for row in message.reply_markup.inline_keyboard:
-            for button in row:
-                if button.url:
-                    links.append(button.url)
-                elif button.text and ("قناة" in button.text or "channel" in button.text.lower()):
-                    extracted = extract_links(button.text)
-                    links.extend(extracted)
-    
+
+    # Now extract ALL links (text + inline buttons)
+    links = extract_all_links(message)
     if not links:
-        print("⚠️ No channel links found in bot reply")
+        print("⚠️ Bot message related to our accounts but no links found.")
         return
-    
-    print(f"📢 Found {len(links)} channel(s) to join")
-    
+
+    print(f"📢 Found {len(links)} channel(s) in bot message. Joining...")
     for link in links:
         await join_channel_for_all_accounts(link)
 
@@ -1140,10 +1172,10 @@ if __name__ == "__main__":
     print("  🔄 Sequential posting system")
     print("  🎯 Template rotation (1, 2, 3...)")
     print("  🔄 Group rotation for each account")
-    print("  📡 Auto-join channels from bot replies")
+    print("  📡 Auto-join channels from any bot reply/mention")
+    print("  ⏰ Auto-leave after 24 hours")
     print("  👥 Reply forwarding to owner")
     print("  💬 Owner reply system")
     print("  📱 Private message handling")
     print("  🛡️ Account ban/freeze monitoring")
-    print("  📨 Instant notifications for errors")
     app.run()
