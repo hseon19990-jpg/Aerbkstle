@@ -98,14 +98,6 @@ db.setdefault("auto_join_groups", True)
 # --- Bot Client ---
 app = Client("auto_post_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# --- Diagnostics ---
-@app.on_message(filters.private & filters.incoming, group=2)
-async def trace_private_messages(client: Client, message: Message):
-    if not message.from_user:
-        return
-    command = (message.text or message.caption or "<non-text>")[:80].replace("\n", " ")
-    print(f"📨 Incoming private message from user_id={message.from_user.id}: {command!r}")
-
 # --- Main Keyboard ---
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
@@ -159,12 +151,12 @@ def get_menu_action(text):
             return action
     return None
 
-# --- Extract ALL links from text and inline buttons ---
+# --- 🛠️ دالة استخراج الروابط (محسّنة بقوة) ---
 def extract_all_links(message: Message):
     links = []
     seen = set()
     
-    # 1. Extract from text or caption
+    # 1. النص أو الكابشن
     text = (message.text or message.caption or "")
     pattern = (
         r'(?:https?://)?t\.me/(?:\+[\w-]+|joinchat/[\w-]+|[A-Za-z0-9_]+)'
@@ -176,23 +168,27 @@ def extract_all_links(message: Message):
             links.append(match)
             seen.add(match)
     
-    # 2. Extract from inline keyboard buttons (all rows, all buttons)
+    # 2. الأزرار (كل الصفوف والأزرار)
     if message.reply_markup:
         for row in message.reply_markup.inline_keyboard:
             for button in row:
-                # Check button.url
                 if button.url:
                     clean = button.url.strip()
                     if clean not in seen:
                         links.append(clean)
                         seen.add(clean)
-                # Check button.text for links (e.g., "قناة: @channel")
                 if button.text:
                     for match in re.findall(pattern, button.text, flags=re.IGNORECASE):
                         if match not in seen:
                             links.append(match)
                             seen.add(match)
     
+    # 3. التعامل مع الروابط بدون "http" (مثل t.me/xxx)
+    for match in re.findall(r't\.me/[^\s]+', text):
+        if match not in seen:
+            links.append(match)
+            seen.add(match)
+            
     return links
 
 # --- Clean group link ---
@@ -213,29 +209,23 @@ def clean_group_link(link):
     return link
 
 def get_next_group(account_index):
-    """الحصول على الكروب التالي بنظام الدوران"""
     groups = db.get("groups", [])
     if not groups:
         return None
-    
     last_index = db.get("last_group_index", {}).get(str(account_index), -1)
     next_index = (last_index + 1) % len(groups)
     db["last_group_index"][str(account_index)] = next_index
     save_data(db)
-    
     return groups[next_index]
 
 def get_next_template():
-    """الحصول على الكليشة التالية بنظام الدوران"""
     templates = db.get("templates", [])
     if not templates:
         return None
-    
     template_index = db.get("template_index", 0)
     template = templates[template_index]
     db["template_index"] = (template_index + 1) % len(templates)
     save_data(db)
-    
     return template
 
 # --- Get account info with caching ---
@@ -243,7 +233,6 @@ async def get_account_info(session_str, index):
     cache_key = f"{index}_{hash(session_str)}"
     if cache_key in account_cache:
         return account_cache[cache_key]
-    
     try:
         temp_client = Client(f"info_session_{index}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
         await temp_client.connect()
@@ -265,7 +254,6 @@ async def get_account_info(session_str, index):
 
 # --- 🔥 Account Status Check ---
 async def check_account_status(client, account_number):
-    """التحقق من حالة الحساب وإرسال إشعارات"""
     try:
         me = await client.get_me()
         return {"status": "active", "message": f"✅ الحساب {account_number} يعمل بشكل طبيعي"}
@@ -282,7 +270,6 @@ async def check_account_status(client, account_number):
         return {"status": "error", "message": error_msg}
 
 async def notify_owner(message):
-    """إرسال إشعار للمالك"""
     try:
         await app.send_message(OWNER_ID, f"⚠️ تنبيه البوت:\n{message}")
     except:
@@ -295,7 +282,6 @@ async def auto_leave_channels():
         try:
             now = datetime.now()
             to_remove = []
-            
             for channel, join_time in db.get("joined_channels", {}).items():
                 try:
                     join_dt = datetime.fromisoformat(join_time)
@@ -303,7 +289,6 @@ async def auto_leave_channels():
                         to_remove.append(channel)
                 except:
                     to_remove.append(channel)
-            
             for channel in to_remove:
                 success = True
                 for idx, session_str in enumerate(db["accounts"]):
@@ -322,14 +307,11 @@ async def auto_leave_channels():
                                 await user_app.stop()
                             except Exception:
                                 pass
-                
                 if success:
                     db["joined_channels"].pop(channel, None)
                     db["channel_join_time"].pop(channel, None)
                     save_data(db)
-                    
             await asyncio.sleep(3600)
-            
         except Exception as e:
             print(f"❌ Auto leave error: {e}")
             await asyncio.sleep(60)
@@ -344,22 +326,18 @@ async def join_channel_for_all_accounts(channel):
     clean_link = clean_group_link(channel)
     if not clean_link:
         return
-    
     if clean_link in db.get("joined_channels", {}):
         print(f"⏭️ Already tracking {clean_link}")
         return
 
     ensure_auto_leave_task()
     joined_any = False
-    
     print(f"📢 Joining {clean_link} for all accounts...")
-    
     for idx, session_str in enumerate(db["accounts"]):
         user_app = None
         try:
             user_app = Client(f"reply_session_{idx}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
             await user_app.start()
-            
             try:
                 await user_app.join_chat(clean_link)
                 joined_any = True
@@ -371,7 +349,6 @@ async def join_channel_for_all_accounts(channel):
                     print(f"✅ Acc {idx+1} is already in {clean_link}")
                 else:
                     print(f"❌ Acc {idx+1} failed to join {clean_link}: {e}")
-                    
         except Exception as e:
             print(f"❌ Error opening acc {idx+1} for {clean_link}: {e}")
         finally:
@@ -380,7 +357,6 @@ async def join_channel_for_all_accounts(channel):
                     await user_app.stop()
                 except Exception:
                     pass
-    
     if joined_any:
         join_time = datetime.now().isoformat()
         db["joined_channels"][clean_link] = join_time
@@ -393,14 +369,11 @@ async def auto_posting_loop():
     global db, account_cache, account_status
     active_clients = []
     account_info = []
-    
     try:
-        # Connect accounts and get info
         for idx, session_str in enumerate(db["accounts"]):
             try:
                 client = Client(f"active_session_{idx}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
                 await client.start()
-                
                 me = await client.get_me()
                 active_clients.append(client)
                 account_info.append({
@@ -411,14 +384,12 @@ async def auto_posting_loop():
                     "client": client
                 })
                 print(f"✅ Account {idx+1} connected: {me.phone_number}")
-                
             except FloodWait as e:
                 error_msg = f"⏳ الحساب {idx+1} ممنوع مؤقتاً لمدة {e.x} ثانية"
                 print(f"⚠️ {error_msg}")
                 await notify_owner(error_msg)
                 active_clients.append(None)
                 account_info.append({"index": idx, "number": idx+1, "status": "flood", "error": str(e)})
-                
             except Exception as e:
                 error_msg = f"❌ فشل اتصال الحساب {idx+1}: {str(e)[:50]}"
                 print(f"⚠️ {error_msg}")
@@ -428,7 +399,6 @@ async def auto_posting_loop():
 
         timer_value = max(5, int(db.get("timer", 60)))
         valid_accounts = [info for info in account_info if info.get("client") is not None]
-        
         if not valid_accounts:
             error_msg = "❌ لا يوجد حسابات نشطة! إيقاف البوت."
             print(error_msg)
@@ -440,8 +410,6 @@ async def auto_posting_loop():
         print(f"🚀 Starting with {len(valid_accounts)} active accounts, timer: {timer_value}s")
         await notify_owner(f"🚀 بدء تشغيل البوت\n📊 {len(valid_accounts)} حساب نشط\n⏱ {timer_value} ثانية")
 
-        # جدولة مركزية: كل حساب يرسل في نفس الدورة
-        account_cursor = 0
         consecutive_errors = {info["number"]: 0 for info in valid_accounts}
         max_errors = 5
 
@@ -455,11 +423,9 @@ async def auto_posting_loop():
                 client = acc_info["client"]
                 acc_number = acc_info["number"]
                 acc_index = acc_info["index"]
-                
                 group = get_next_group(acc_index)
                 if group is None:
                     continue
-                
                 template = get_next_template()
                 if template is None:
                     continue
@@ -479,10 +445,7 @@ async def auto_posting_loop():
                             await notify_owner(error_msg)
                         continue
 
-                    # إرسال الرسالة
                     sent_msg = await client.send_message(group, template)
-                    
-                    # تسجيل الرسالة المرسلة
                     db["stats"]["sent_count"] += 1
                     db.setdefault("outgoing_messages", {})
                     db["outgoing_messages"].setdefault(str(sent_msg.chat.id), {})
@@ -491,9 +454,7 @@ async def auto_posting_loop():
                         "time": datetime.now().isoformat(),
                         "template": template
                     }
-                    
                     db["last_group_index"][str(acc_index)] = db["groups"].index(group)
-                    
                     save_data(db)
                     consecutive_errors[acc_number] = 0
                     print(f"✅ Acc {acc_number} sent message to {group}")
@@ -529,7 +490,6 @@ async def auto_posting_loop():
                             print(f"🧹 Removed invalid group: {group}")
 
             await asyncio.sleep(timer_value)
-        
     except Exception as e:
         error_msg = f"❌ خطأ رئيسي في حلقة النشر: {str(e)}"
         print(f"❌ {error_msg}")
@@ -541,49 +501,44 @@ async def auto_posting_loop():
                     await client.stop()
                 except:
                     pass
-        
         if db["is_running"]:
             db["is_running"] = False
             save_data(db)
             await notify_owner("🛑 تم إيقاف البوت تلقائياً بسبب خطأ")
 
-# --- ✅ NEW: Handle ANY bot message with channel links in groups ---
-@app.on_message(filters.group & filters.incoming)
+# --- ✅ المعالج الأهم والأول: أي رسالة من بوت تحتوي روابط ---
+# تم وضعه كأول معالج (group=0) ليعمل قبل أي شيء آخر
+@app.on_message(filters.group & filters.incoming, group=0)
 async def handle_bot_messages_with_links(client: Client, message: Message):
-    # 1. Must be from a bot
+    # 1. يجب أن تكون الرسالة من بوت
     if not message.from_user or not message.from_user.is_bot:
         return
 
-    # 2. Extract ALL links from the bot message (text + inline buttons)
+    # 2. استخراج جميع الروابط من النص والأزرار
     links = extract_all_links(message)
     if not links:
-        return  # لا توجد روابط قنوات -> تجاهل
+        return
 
-    # 3. Join all accounts to the extracted channels
+    # 3. الانضمام لجميع الحسابات
     print(f"🤖 Bot '{message.from_user.username}' sent a message with {len(links)} channel link(s). Joining...")
     for link in links:
         await join_channel_for_all_accounts(link)
 
 # --- Handle user replies to bot messages (in groups) ---
-@app.on_message(filters.group & filters.incoming)
+@app.on_message(filters.group & filters.incoming, group=1)
 async def handle_user_replies(client: Client, message: Message):
     if not message.from_user or message.from_user.is_bot:
         return
-    
     replied_message = message.reply_to_message
     if not replied_message or not replied_message.from_user:
         return
-    
     chat_id = str(message.chat.id)
-    
     is_our_message = False
     if chat_id in db.get("outgoing_messages", {}):
         if replied_message.id in db["outgoing_messages"][chat_id]:
             is_our_message = True
-    
     if not is_our_message:
         return
-    
     user_info = f"""
 📩 **رد وارد على رسالة البوت**
 
@@ -608,15 +563,13 @@ async def handle_user_replies(client: Client, message: Message):
 🔄 **للرد:** أرسل رسالة تحتوي على:
 `/reply {message.from_user.id} {message.chat.id} {message.id} رسالتك`
 """
-
     await app.send_message(OWNER_ID, user_info)
 
 # --- Handle private messages from users (non-owner) ---
-@app.on_message(filters.private & filters.incoming & ~filters.user(OWNER_ID))
+@app.on_message(filters.private & filters.incoming & ~filters.user(OWNER_ID), group=2)
 async def handle_private_messages(client: Client, message: Message):
     if not message.from_user:
         return
-    
     user_info = f"""
 📩 **رسالة خاصة جديدة**
 
@@ -634,16 +587,14 @@ async def handle_private_messages(client: Client, message: Message):
 🔄 **للرد:** أرسل رسالة تحتوي على:
 `/reply_private {message.from_user.id} {message.id} رسالتك`
 """
-    
     await app.send_message(OWNER_ID, user_info)
 
 # --- MAIN HANDLER FOR OWNER (UNIFIED) ---
-@app.on_message(filters.private & filters.user(OWNER_ID) & filters.text)
+@app.on_message(filters.private & filters.user(OWNER_ID) & filters.text, group=3)
 async def handle_owner_commands(client: Client, message: Message):
     text = message.text.strip()
     user_id_str = str(OWNER_ID)
-    
-    # 1. Check for /reply and /reply_private commands first
+
     if text.startswith("/reply"):
         parts = text.split(maxsplit=3)
         if len(parts) >= 4:
@@ -651,60 +602,44 @@ async def handle_owner_commands(client: Client, message: Message):
                 user_id = int(parts[1])
                 chat_id = int(parts[2])
                 reply_text = parts[3]
-                
                 account_number = None
                 if str(chat_id) in db.get("outgoing_messages", {}):
                     for msg_id, msg_info in db["outgoing_messages"][str(chat_id)].items():
                         if int(msg_id) == int(parts[2]) or True:
                             account_number = msg_info.get("from_account")
                             break
-                
                 if account_number:
                     account_index = account_number - 1
                     if account_index < len(db["accounts"]):
                         session_str = db["accounts"][account_index]
                         user_client = Client(f"reply_client_{account_index}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
                         await user_client.start()
-                        
-                        await user_client.send_message(
-                            chat_id,
-                            reply_text,
-                            reply_to_message_id=int(parts[2])
-                        )
-                        
+                        await user_client.send_message(chat_id, reply_text, reply_to_message_id=int(parts[2]))
                         await user_client.stop()
                         await message.reply_text(f"✅ تم إرسال الرد من الحساب {account_number}")
                     else:
                         await message.reply_text("❌ الحساب غير موجود")
                 else:
                     await message.reply_text("❌ لم يتم العثور على الحساب المرسل")
-                    
             except Exception as e:
                 await message.reply_text(f"❌ خطأ: {e}")
         return
-    
+
     if text.startswith("/reply_private"):
         parts = text.split(maxsplit=2)
         if len(parts) >= 3:
             try:
                 user_id = int(parts[1])
                 reply_text = parts[2]
-                
-                await app.send_message(
-                    user_id,
-                    f"💬 **رد من الإدارة:**\n\n{reply_text}"
-                )
-                
+                await app.send_message(user_id, f"💬 **رد من الإدارة:**\n\n{reply_text}")
                 await message.reply_text("✅ تم إرسال الرد")
-                
             except Exception as e:
                 await message.reply_text(f"❌ خطأ: {e}")
         return
-    
+
     if text.lower().startswith("/start"):
         return
-    
-    # 2. Handle state-based inputs (waiting for phone, otp, password, etc.)
+
     state = db["user_state"].get(user_id_str)
     if state:
         if state == "WAITING_PHONE":
@@ -720,7 +655,6 @@ async def handle_owner_commands(client: Client, message: Message):
                     await temp_client.disconnect()
                 except:
                     continue
-            
             session_name = f"temp_session_{OWNER_ID}"
             temp_client = Client(session_name, api_id=API_ID, api_hash=API_HASH)
             await temp_client.connect()
@@ -855,12 +789,11 @@ async def handle_owner_commands(client: Client, message: Message):
                 return await message.reply_text(f"✅ تم ضبط المؤقت على {text} ثانية")
             else:
                 return await message.reply_text("❌ أرسل رقمًا صحيحًا بين 2 و86400")
-    
-    # 3. Handle menu actions (buttons)
+
     action = get_menu_action(text)
     if action:
         db["user_state"].pop(user_id_str, None)
-        
+
         if action == "accounts":
             if not db["accounts"]:
                 return await message.reply_text("❌ لا توجد حسابات مضافة.")
@@ -996,7 +929,6 @@ async def handle_owner_commands(client: Client, message: Message):
         elif action == "incoming_replies":
             if not db.get("outgoing_messages", {}):
                 return await message.reply_text("❌ لا توجد ردود واردة.")
-            
             msg = "👥 الردود الواردة:\n\n"
             for chat_id, messages in db["outgoing_messages"].items():
                 for msg_id, msg_info in messages.items():
@@ -1005,7 +937,6 @@ async def handle_owner_commands(client: Client, message: Message):
                     msg += f"🤖 حساب: {msg_info.get('from_account', '؟')}\n"
                     msg += f"⏰ وقت: {msg_info.get('time', '؟')}\n"
                     msg += "---\n"
-            
             await message.reply_text(msg)
 
         elif action == "reply_status":
@@ -1027,8 +958,7 @@ async def handle_owner_commands(client: Client, message: Message):
             )
 
         return
-    
-    # 4. If nothing matched, show error
+
     await message.reply_text("لم أفهم الأمر. أرسل /start ثم اختر أحد أزرار القائمة.")
 
 # --- Selection Helper ---
@@ -1045,14 +975,11 @@ def create_selection_list(items, item_type, action):
 async def handle_callback(client: Client, callback_query):
     if callback_query.from_user.id != OWNER_ID:
         return await callback_query.answer("غير مصرح")
-    
     data = callback_query.data
     await callback_query.answer()
-    
     if data == "cancel":
         await callback_query.message.delete()
         return
-
     if data.startswith("delete_template_"):
         index = int(data.split("_")[2])
         if 0 <= index < len(db["templates"]):
@@ -1062,7 +989,6 @@ async def handle_callback(client: Client, callback_query):
             await callback_query.message.reply_text(f"🗑 تم حذف الكليشة: {deleted[:50]}...")
         else:
             await callback_query.message.reply_text("❌ العنصر غير موجود.")
-
     elif data.startswith("delete_group_"):
         index = int(data.split("_")[2])
         if 0 <= index < len(db["groups"]):
@@ -1072,7 +998,6 @@ async def handle_callback(client: Client, callback_query):
             await callback_query.message.reply_text(f"🗑 تم حذف الكروب: {deleted}")
         else:
             await callback_query.message.reply_text("❌ العنصر غير موجود.")
-
     elif data.startswith("delete_account_"):
         index = int(data.split("_")[2])
         if 0 <= index < len(db["accounts"]):
@@ -1102,13 +1027,10 @@ async def start_cmd(client: Client, message: Message):
         return
     if message.from_user.id != OWNER_ID:
         return await message.reply_text("⛔ هذا البوت مخصص لمالكه فقط.")
-    
     if db.get("joined_channels"):
         ensure_auto_leave_task()
-    
     db["user_state"].pop(str(OWNER_ID), None)
     save_data(db)
-    
     await message.reply_text(
         "🤖 بوت النشر التلقائي\n\n"
         f"📊 الحسابات: {len(db['accounts'])}\n"
