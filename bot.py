@@ -42,6 +42,7 @@ account_cache = {}
 posting_task = None
 auto_leave_task = None
 account_status = {}
+userbot_tasks = []  # لتخزين مهام مراقبة الحسابات
 
 # --- Load/Save Data ---
 def load_data():
@@ -506,20 +507,51 @@ async def auto_posting_loop():
             save_data(db)
             await notify_owner("🛑 تم إيقاف البوت تلقائياً بسبب خطأ")
 
-# --- ✅ المعالج الأهم والأول: أي رسالة من بوت تحتوي روابط ---
-# تم وضعه كأول معالج (group=0) ليعمل قبل أي شيء آخر
+# ===== ⭐ جديد: مراقبة الحسابات (Userbots) لاستقبال رسائل البوتات في الكروبات =====
+async def start_userbot_monitor(session_str, index):
+    """تشغيل عميل لكل حساب لمراقبة رسائل البوتات في الكروبات"""
+    client = Client(f"userbot_{index}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
+    
+    @client.on_message(filters.group & filters.incoming)
+    async def userbot_message_handler(ub_client, message):
+        if not message.from_user or not message.from_user.is_bot:
+            return
+        print(f"🤖 Userbot {index+1} saw bot message from {message.from_user.username}")
+        links = extract_all_links(message)
+        if not links:
+            return
+        print(f"✅ Userbot {index+1} found links: {links}")
+        for link in links:
+            await join_channel_for_all_accounts(link)
+    
+    try:
+        await client.start()
+        print(f"✅ Userbot {index+1} started monitoring groups")
+        # إبقاء العميل حياً
+        while True:
+            await asyncio.sleep(3600)
+    except Exception as e:
+        print(f"❌ Userbot {index+1} failed: {str(e)[:80]}")
+    finally:
+        await client.stop()
+
+async def start_all_userbots():
+    """تشغيل جميع حسابات المراقبة"""
+    global userbot_tasks
+    userbot_tasks = []
+    for idx, session_str in enumerate(db["accounts"]):
+        task = asyncio.create_task(start_userbot_monitor(session_str, idx))
+        userbot_tasks.append(task)
+    print(f"🚀 Started monitoring for {len(userbot_tasks)} accounts")
+
+# --- ✅ المعالج الأهم والأول: أي رسالة من بوت تحتوي روابط (يعمل إذا كان البوت الرئيسي عضواً) ---
 @app.on_message(filters.group & filters.incoming, group=0)
 async def handle_bot_messages_with_links(client: Client, message: Message):
-    # 1. يجب أن تكون الرسالة من بوت
     if not message.from_user or not message.from_user.is_bot:
         return
-
-    # 2. استخراج جميع الروابط من النص والأزرار
     links = extract_all_links(message)
     if not links:
         return
-
-    # 3. الانضمام لجميع الحسابات
     print(f"🤖 Bot '{message.from_user.username}' sent a message with {len(links)} channel link(s). Joining...")
     for link in links:
         await join_channel_for_all_accounts(link)
@@ -1059,10 +1091,15 @@ if __name__ == "__main__":
     print("  🔄 Sequential posting system")
     print("  🎯 Template rotation (1, 2, 3...)")
     print("  🔄 Group rotation for each account")
-    print("  📡 Auto-join channels from ANY bot message")
+    print("  📡 Auto-join channels from ANY bot message (Userbots)")
     print("  ⏰ Auto-leave after 24 hours")
     print("  👥 Reply forwarding to owner")
     print("  💬 Owner reply system")
     print("  📱 Private message handling")
     print("  🛡️ Account ban/freeze monitoring")
+    
+    # تشغيل مراقبة الحسابات (Userbots) أولاً
+    asyncio.get_event_loop().run_until_complete(start_all_userbots())
+    
+    # ثم تشغيل البوت الرئيسي
     app.run()
