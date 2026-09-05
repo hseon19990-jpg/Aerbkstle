@@ -42,8 +42,8 @@ account_cache = {}
 posting_task = None
 auto_leave_task = None
 account_status = {}
-reply_mapping = {}  # لتتبع الردود
-pending_owner_replies = {}  # انتظار رد المالك
+reply_mapping = {}
+pending_owner_replies = {}
 
 # --- Load/Save Data ---
 def load_data():
@@ -62,9 +62,9 @@ def load_data():
             "joined_channels": {},
             "channel_join_time": {},
             "account_errors": {},
-            "last_group_index": {},  # تتبع آخر كروب لكل حساب
-            "template_index": 0,  # تتبع آخر كليشة مستخدمة
-            "auto_join_groups": True  # الانضمام التلقائي للكروبات
+            "last_group_index": {},
+            "template_index": 0,
+            "auto_join_groups": True
         }
         os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
         with open(DATA_FILE, "w", encoding="utf-8") as f:
@@ -99,14 +99,6 @@ db.setdefault("auto_join_groups", True)
 
 # --- Bot Client ---
 app = Client("auto_post_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-
-# --- Diagnostics ---
-@app.on_message(filters.private & filters.incoming, group=2)
-async def trace_private_messages(client: Client, message: Message):
-    if not message.from_user:
-        return
-    command = (message.text or message.caption or "<non-text>")[:80].replace("\n", " ")
-    print(f"📨 Incoming private message from user_id={message.from_user.id}: {command!r}")
 
 # --- Main Keyboard ---
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
@@ -199,7 +191,6 @@ def get_next_group(account_index):
     if not groups:
         return None
     
-    # استخدام آخر كروب للحساب
     last_index = db.get("last_group_index", {}).get(str(account_index), -1)
     next_index = (last_index + 1) % len(groups)
     db["last_group_index"][str(account_index)] = next_index
@@ -369,7 +360,7 @@ async def join_channel_for_all_accounts(channel):
         save_data(db)
         print(f"✅ Channel {clean_link} registered for auto-leave in 12 hours")
 
-# --- 🚀 MAIN POSTING LOOP WITH PROPER SCHEDULING ---
+# --- 🚀 MAIN POSTING LOOP ---
 async def auto_posting_loop():
     global db, account_cache, account_status
     active_clients = []
@@ -382,7 +373,6 @@ async def auto_posting_loop():
                 client = Client(f"active_session_{idx}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
                 await client.start()
                 
-                # التحقق من حالة الحساب
                 me = await client.get_me()
                 active_clients.append(client)
                 account_info.append({
@@ -422,7 +412,7 @@ async def auto_posting_loop():
         print(f"🚀 Starting with {len(valid_accounts)} active accounts, timer: {timer_value}s")
         await notify_owner(f"🚀 بدء تشغيل البوت\n📊 {len(valid_accounts)} حساب نشط\n⏱ {timer_value} ثانية")
 
-        # جدولة مركزية: كل حساب يرسل في نفس الوقت
+        # جدولة مركزية: كل حساب يرسل في نفس الدورة
         account_cursor = 0
         consecutive_errors = {info["number"]: 0 for info in valid_accounts}
         max_errors = 5
@@ -433,18 +423,15 @@ async def auto_posting_loop():
                 save_data(db)
                 break
 
-            # إرسال من جميع الحسابات في نفس الدورة
             for acc_info in valid_accounts:
                 client = acc_info["client"]
                 acc_number = acc_info["number"]
                 acc_index = acc_info["index"]
                 
-                # الحصول على الكروب التالي لهذا الحساب
                 group = get_next_group(acc_index)
                 if group is None:
                     continue
                 
-                # الحصول على الكليشة التالية
                 template = get_next_template()
                 if template is None:
                     continue
@@ -477,7 +464,6 @@ async def auto_posting_loop():
                         "template": template
                     }
                     
-                    # تسجيل آخر كروب للحساب
                     db["last_group_index"][str(acc_index)] = db["groups"].index(group)
                     
                     save_data(db)
@@ -514,7 +500,6 @@ async def auto_posting_loop():
                             save_data(db)
                             print(f"🧹 Removed invalid group: {group}")
 
-            # انتظار المؤقت بعد إرسال جميع الحسابات
             await asyncio.sleep(timer_value)
         
     except Exception as e:
@@ -588,7 +573,6 @@ async def handle_user_replies(client: Client, message: Message):
     
     chat_id = str(message.chat.id)
     
-    # التحقق إذا كانت الرسالة المرتبطة من بوتنا
     is_our_message = False
     if chat_id in db.get("outgoing_messages", {}):
         if replied_message.id in db["outgoing_messages"][chat_id]:
@@ -597,7 +581,6 @@ async def handle_user_replies(client: Client, message: Message):
     if not is_our_message:
         return
     
-    # إرسال تفاصيل الرد للمالك
     user_info = f"""
 📩 **رد وارد على رسالة البوت**
 
@@ -656,7 +639,6 @@ async def handle_private_messages(client: Client, message: Message):
 async def handle_owner_replies(client: Client, message: Message):
     text = message.text.strip()
     
-    # معالجة رد المالك على رسائل الكروبات
     if text.startswith("/reply"):
         parts = text.split(maxsplit=3)
         if len(parts) >= 4:
@@ -665,23 +647,20 @@ async def handle_owner_replies(client: Client, message: Message):
                 chat_id = int(parts[2])
                 reply_text = parts[3]
                 
-                # البحث عن الحساب الذي أرسل الرسالة
                 account_number = None
                 if str(chat_id) in db.get("outgoing_messages", {}):
                     for msg_id, msg_info in db["outgoing_messages"][str(chat_id)].items():
-                        if int(msg_id) == int(parts[2]) or True:  # البحث في كل الرسائل
+                        if int(msg_id) == int(parts[2]) or True:
                             account_number = msg_info.get("from_account")
                             break
                 
                 if account_number:
-                    # إرسال الرد من الحساب المناسب
                     account_index = account_number - 1
                     if account_index < len(db["accounts"]):
                         session_str = db["accounts"][account_index]
                         user_client = Client(f"reply_client_{account_index}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
                         await user_client.start()
                         
-                        # إرسال الرد كرد على الرسالة الأصلية
                         await user_client.send_message(
                             chat_id,
                             reply_text,
@@ -698,7 +677,6 @@ async def handle_owner_replies(client: Client, message: Message):
             except Exception as e:
                 await message.reply_text(f"❌ خطأ: {e}")
     
-    # معالجة رد المالك على الرسائل الخاصة
     elif text.startswith("/reply_private"):
         parts = text.split(maxsplit=2)
         if len(parts) >= 3:
@@ -706,7 +684,6 @@ async def handle_owner_replies(client: Client, message: Message):
                 user_id = int(parts[1])
                 reply_text = parts[2]
                 
-                # إرسال الرد من البوت الرئيسي
                 await app.send_message(
                     user_id,
                     f"💬 **رد من الإدارة:**\n\n{reply_text}"
@@ -806,9 +783,9 @@ async def handle_callback(client: Client, callback_query):
         else:
             await callback_query.message.reply_text("❌ العنصر غير موجود.")
 
-# --- Main handler ---
+# --- Main handler (OLD MENU ACTIONS) ---
 @app.on_message(filters.private & filters.user(OWNER_ID) & filters.text)
-async def handle_menu(client: Client, message: Message):
+async def handle_menu_actions(client: Client, message: Message):
     text = message.text.strip()
     if text.lower().startswith("/start"):
         return
@@ -1147,25 +1124,6 @@ async def toggle_auto_join(client: Client, message: Message):
     save_data(db)
     status = "مفعل" if db["auto_join_groups"] else "معطل"
     await message.reply_text(f"✅ الانضمام التلقائي للكروبات الآن: {status}")
-
-# --- Track deleted messages ---
-@app.on_message(filters.group & filters.incoming, group=3)
-async def track_deleted_messages(client: Client, message: Message):
-    if not message.from_user:
-        return
-    
-    chat_id = str(message.chat.id)
-    
-    # قياس نشاط الكروب
-    db.setdefault("group_activity", {})
-    db["group_activity"][chat_id] = db["group_activity"].get(chat_id, 0) + 1
-    if message.chat.username:
-        username_key = f"@{message.chat.username}"
-        db["group_activity"][username_key] = (
-            db["group_activity"].get(username_key, 0) + 1
-        )
-    
-    save_data(db)
 
 # --- Main execution ---
 if __name__ == "__main__":
