@@ -214,21 +214,53 @@ def clean_group_link(link):
         link = f"@{link}"
     return link
 
+GROUP_RETRY_MINUTES = 15
+
+
+def get_account_group_blocks(account_number):
+    """إرجاع حالات التجميد المؤقتة مع ترحيل الصيغة القديمة."""
+    all_blocks = db.setdefault("account_blocked_groups", {})
+    key = str(account_number)
+    blocks = all_blocks.setdefault(key, {})
+    if isinstance(blocks, list):
+        retry_until = (datetime.now() + timedelta(minutes=GROUP_RETRY_MINUTES)).isoformat()
+        blocks = {group: retry_until for group in blocks}
+        all_blocks[key] = blocks
+    return blocks
+
+
 def get_next_group(account_number=None):
-    """اختيار الكروب التالي بعد آخر إرسال مع تجاهل الكروبات المحظورة لهذا الحساب."""
+    """اختيار الكروب التالي وتجاوز التجميد المؤقت فقط."""
     groups = db.get("groups", [])
     if not groups:
         return None
-    blocked = set(db.get("account_blocked_groups", {}).get(str(account_number), [])) if account_number else set()
+    blocked = get_account_group_blocks(account_number) if account_number else {}
+    now = datetime.now()
+    expired = []
     last_index = db.get("last_sent_group_index", -1)
     if not isinstance(last_index, int) or last_index < -1:
         last_index = -1
     for offset in range(len(groups)):
         candidate_index = (last_index + 1 + offset) % len(groups)
         candidate = groups[candidate_index]
-        if candidate not in blocked:
-            return candidate
-    return None
+        retry_until = blocked.get(candidate)
+        if retry_until:
+            try:
+                if datetime.fromisoformat(retry_until) > now:
+                    continue
+                expired.append(candidate)
+            except (TypeError, ValueError):
+                expired.append(candidate)
+        return_candidate = candidate
+        break
+    else:
+        return_candidate = None
+
+    for group in expired:
+        blocked.pop(group, None)
+    if expired:
+        save_data(db)
+    return return_candidate
 
 
 def advance_group_after_attempt(group):
@@ -258,19 +290,11 @@ def is_permanent_group_error(error_text):
 
 
 def block_account_from_group(account_number, group):
-    """حظر الكروب لهذا الحساب فقط، وحذفه إذا عجزت عنه كل الحسابات."""
-    blocked = db.setdefault("account_blocked_groups", {}).setdefault(str(account_number), [])
-    if group not in blocked:
-        blocked.append(group)
-
-    account_count = len(db.get("accounts", []))
-    blocked_by_all = account_count > 0 and all(
-        group in db.get("account_blocked_groups", {}).get(str(index), [])
-        for index in range(1, account_count + 1)
-    )
-    if blocked_by_all and group in db.get("groups", []):
-        db["groups"].remove(group)
-        print(f"🧹 Removed group with no writable account: {group}")
+    """تجميد الكروب لهذا الحساب مؤقتًا بدون حذفه من القائمة."""
+    blocked = get_account_group_blocks(account_number)
+    retry_until = datetime.now() + timedelta(minutes=GROUP_RETRY_MINUTES)
+    blocked[group] = retry_until.isoformat()
+    print(f"⏸️ Account {account_number} will retry {group} after {retry_until.isoformat()}")
     save_data(db)
 
 
@@ -925,7 +949,9 @@ async def handle_owner_commands(client: Client, message: Message):
                         db["groups"].append(group)
                         db.setdefault("group_activity", {}).setdefault(group, 0)
                         for blocked_groups in db.setdefault("account_blocked_groups", {}).values():
-                            if group in blocked_groups:
+                            if isinstance(blocked_groups, dict):
+                                blocked_groups.pop(group, None)
+                            elif group in blocked_groups:
                                 blocked_groups.remove(group)
                         added_count += 1
             db["user_state"].pop(user_id_str, None)
