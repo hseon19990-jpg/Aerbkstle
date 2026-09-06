@@ -43,6 +43,7 @@ posting_task = None
 auto_leave_task = None
 account_status = {}
 userbot_tasks = []  # لتخزين مهام مراقبة الحسابات
+forwarded_incoming = set()  # منع تكرار تحويل نفس الرسالة للمالك
 
 # --- Load/Save Data ---
 def load_data():
@@ -62,7 +63,9 @@ def load_data():
             "channel_join_time": {},
             "account_errors": {},
             "last_group_index": {},
+            "last_sent_group_index": -1,
             "template_index": 0,
+            "incoming_messages": {},
             "auto_join_groups": True
         }
         os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
@@ -93,7 +96,9 @@ db.setdefault("joined_channels", {})
 db.setdefault("channel_join_time", {})
 db.setdefault("account_errors", {})
 db.setdefault("last_group_index", {})
+db.setdefault("last_sent_group_index", -1)
 db.setdefault("template_index", 0)
+db.setdefault("incoming_messages", {})
 db.setdefault("auto_join_groups", True)
 
 # --- Bot Client ---
@@ -156,40 +161,38 @@ def get_menu_action(text):
 def extract_all_links(message: Message):
     links = []
     seen = set()
-    
-    # 1. النص أو الكابشن
-    text = (message.text or message.caption or "")
-    pattern = (
-        r'(?:https?://)?t\.me/(?:\+[\w-]+|joinchat/[\w-]+|[A-Za-z0-9_]+)'
-        r'|@[A-Za-z0-9_]{4,}'
-        r'|(?<!\d)-100\d{6,}'
-    )
-    for match in re.findall(pattern, text, flags=re.IGNORECASE):
-        if match not in seen:
-            links.append(match)
-            seen.add(match)
-    
-    # 2. الأزرار (كل الصفوف والأزرار)
-    if message.reply_markup:
-        for row in message.reply_markup.inline_keyboard:
-            for button in row:
-                if button.url:
-                    clean = button.url.strip()
-                    if clean not in seen:
-                        links.append(clean)
-                        seen.add(clean)
-                if button.text:
-                    for match in re.findall(pattern, button.text, flags=re.IGNORECASE):
-                        if match not in seen:
-                            links.append(match)
-                            seen.add(match)
-    
-    # 3. التعامل مع الروابط بدون "http" (مثل t.me/xxx)
-    for match in re.findall(r't\.me/[^\s]+', text):
-        if match not in seen:
-            links.append(match)
-            seen.add(match)
-            
+
+    def add_value(value):
+        if not value:
+            return
+        value = str(value).strip().rstrip(".,;:!?)]}")
+        pattern = (r'(?:https?://)?t\.me/(?:\+[\w-]+|joinchat/[\w-]+|[A-Za-z0-9_]+)'
+                   r'|@[A-Za-z0-9_]{4,}'
+                   r'|(?<!\d)-100\d{6,}')
+        for match in re.findall(pattern, value, flags=re.IGNORECASE):
+            if match not in seen:
+                links.append(match)
+                seen.add(match)
+        if re.fullmatch(r'-100\d{6,}', value) and value not in seen:
+            links.append(value)
+            seen.add(value)
+
+    add_value(message.text or message.caption or "")
+    for entity in (message.entities or message.caption_entities or []):
+        add_value(getattr(entity, "url", None))
+
+    markup = message.reply_markup
+    rows = []
+    if markup:
+        rows = getattr(markup, "inline_keyboard", None) or getattr(markup, "keyboard", None) or []
+    for row in rows:
+        for button in row:
+            add_value(getattr(button, "url", None))
+            add_value(getattr(button, "text", None))
+            add_value(getattr(button, "callback_data", None))
+            web_app = getattr(button, "web_app", None)
+            add_value(getattr(web_app, "url", None) if web_app else None)
+
     return links
 
 # --- Clean group link ---
@@ -209,25 +212,31 @@ def clean_group_link(link):
         link = f"@{link}"
     return link
 
-def get_next_group(account_index):
+def get_next_group(account_index=None):
+    """اختيار الكروب التالي بعد آخر كروب نجح فيه الإرسال لجميع الحسابات."""
     groups = db.get("groups", [])
     if not groups:
         return None
-    last_index = db.get("last_group_index", {}).get(str(account_index), -1)
-    next_index = (last_index + 1) % len(groups)
-    db["last_group_index"][str(account_index)] = next_index
-    save_data(db)
-    return groups[next_index]
+    last_index = db.get("last_sent_group_index", -1)
+    if not isinstance(last_index, int) or last_index < -1:
+        last_index = -1
+    return groups[(last_index + 1) % len(groups)]
+
+
+def mark_group_sent(group):
+    """حفظ آخر كروب تم الإرسال إليه فعلاً."""
+    groups = db.get("groups", [])
+    if group in groups:
+        db["last_sent_group_index"] = groups.index(group)
+        db.setdefault("group_activity", {})[group] = datetime.now().isoformat()
+        save_data(db)
+
 
 def get_next_template():
     templates = db.get("templates", [])
     if not templates:
         return None
-    template_index = db.get("template_index", 0)
-    template = templates[template_index]
-    db["template_index"] = (template_index + 1) % len(templates)
-    save_data(db)
-    return template
+    return random.choice(templates)
 
 # --- Get account info with caching ---
 async def get_account_info(session_str, index):
@@ -366,6 +375,29 @@ async def join_channel_for_all_accounts(channel):
         print(f"✅ Channel {clean_link} registered for auto-leave in 24 hours")
 
 # --- 🚀 MAIN POSTING LOOP ---
+async def ensure_account_in_group(client, group, account_number):
+    """التأكد من أن الحساب عضو في الكروب قبل إرسال الرسالة."""
+    try:
+        member = await client.get_chat_member(group, "me")
+        status = getattr(member, "status", "")
+        status = getattr(status, "value", status)
+        if str(status).lower() not in ("left", "kicked", "banned"):
+            return True
+    except Exception:
+        pass
+
+    try:
+        await client.join_chat(group)
+        print(f"✅ Account {account_number} joined {group} before posting")
+        return True
+    except Exception as e:
+        error_text = str(e).upper()
+        if "ALREADY_PARTICIPANT" in error_text or "USER_ALREADY_PARTICIPANT" in error_text:
+            return True
+        print(f"❌ Account {account_number} could not join {group}: {e}")
+        return False
+
+
 async def auto_posting_loop():
     global db, account_cache, account_status
     active_clients = []
@@ -398,7 +430,7 @@ async def auto_posting_loop():
                 active_clients.append(None)
                 account_info.append({"index": idx, "number": idx+1, "status": "error", "error": str(e)})
 
-        timer_value = max(5, int(db.get("timer", 60)))
+        timer_value = max(1, int(db.get("timer", 60)))
         valid_accounts = [info for info in account_info if info.get("client") is not None]
         if not valid_accounts:
             error_msg = "❌ لا يوجد حسابات نشطة! إيقاف البوت."
@@ -408,8 +440,8 @@ async def auto_posting_loop():
             save_data(db)
             return
 
-        print(f"🚀 Starting with {len(valid_accounts)} active accounts, timer: {timer_value}s")
-        await notify_owner(f"🚀 بدء تشغيل البوت\n📊 {len(valid_accounts)} حساب نشط\n⏱ {timer_value} ثانية")
+        print(f"🚀 Starting with {len(valid_accounts)} active accounts, interval: {timer_value}s")
+        await notify_owner(f"🚀 بدء تشغيل البوت\n📊 {len(valid_accounts)} حساب نشط\n⏱ الفاصل بين كل إرسال: {timer_value} ثانية")
 
         consecutive_errors = {info["number"]: 0 for info in valid_accounts}
         max_errors = 5
@@ -420,11 +452,16 @@ async def auto_posting_loop():
                 save_data(db)
                 break
 
-            for acc_info in valid_accounts:
+            accounts_this_round = valid_accounts.copy()
+            random.shuffle(accounts_this_round)
+
+            for acc_info in accounts_this_round:
+                if not db["is_running"]:
+                    break
+                await asyncio.sleep(timer_value)
                 client = acc_info["client"]
                 acc_number = acc_info["number"]
-                acc_index = acc_info["index"]
-                group = get_next_group(acc_index)
+                group = get_next_group()
                 if group is None:
                     continue
                 template = get_next_template()
@@ -432,6 +469,11 @@ async def auto_posting_loop():
                     continue
 
                 try:
+                    if not await ensure_account_in_group(client, group, acc_number):
+                        db["stats"]["failed_count"] += 1
+                        save_data(db)
+                        continue
+
                     status = await check_account_status(client, acc_number)
                     if status["status"] == "flood":
                         wait_time = status.get("wait", timer_value)
@@ -449,13 +491,12 @@ async def auto_posting_loop():
                     sent_msg = await client.send_message(group, template)
                     db["stats"]["sent_count"] += 1
                     db.setdefault("outgoing_messages", {})
-                    db["outgoing_messages"].setdefault(str(sent_msg.chat.id), {})
-                    db["outgoing_messages"][str(sent_msg.chat.id)][sent_msg.id] = {
+                    db["outgoing_messages"].setdefault(str(sent_msg.chat.id), {})[sent_msg.id] = {
                         "from_account": acc_number,
                         "time": datetime.now().isoformat(),
                         "template": template
                     }
-                    db["last_group_index"][str(acc_index)] = db["groups"].index(group)
+                    mark_group_sent(group)
                     save_data(db)
                     consecutive_errors[acc_number] = 0
                     print(f"✅ Acc {acc_number} sent message to {group}")
@@ -490,7 +531,6 @@ async def auto_posting_loop():
                             save_data(db)
                             print(f"🧹 Removed invalid group: {group}")
 
-            await asyncio.sleep(timer_value)
     except Exception as e:
         error_msg = f"❌ خطأ رئيسي في حلقة النشر: {str(e)}"
         print(f"❌ {error_msg}")
@@ -508,26 +548,92 @@ async def auto_posting_loop():
             await notify_owner("🛑 تم إيقاف البوت تلقائياً بسبب خطأ")
 
 # ===== ⭐ جديد: مراقبة الحسابات (Userbots) لاستقبال رسائل البوتات في الكروبات =====
+def get_message_context(chat_id, message_id):
+    """العثور على معلومات الرسالة المرسلة أو المحفوظة من كروب."""
+    for collection in ("outgoing_messages", "incoming_messages"):
+        chat_messages = db.get(collection, {}).get(str(chat_id), {})
+        info = chat_messages.get(message_id) or chat_messages.get(str(message_id))
+        if info:
+            return info
+    return None
+
+
+def is_configured_group(message):
+    chat_id = str(getattr(message.chat, "id", ""))
+    username = getattr(message.chat, "username", None)
+    possible_names = {chat_id}
+    if username:
+        possible_names.update({username, f"@{username}"})
+    return any(clean_group_link(group) in possible_names for group in db.get("groups", []))
+
+
+async def forward_group_message_to_owner(message, source_account=None):
+    """تحويل الردود والرسائل العادية من الكروبات للمالك مرة واحدة فقط."""
+    if not message.from_user or message.from_user.is_bot:
+        return
+
+    chat_id = str(message.chat.id)
+    replied = message.reply_to_message
+    reply_info = get_message_context(chat_id, replied.id) if replied else None
+    if not reply_info and not is_configured_group(message):
+        return
+
+    key = (chat_id, message.id)
+    if key in forwarded_incoming:
+        return
+    forwarded_incoming.add(key)
+    if len(forwarded_incoming) > 5000:
+        forwarded_incoming.clear()
+
+    account_number = (reply_info or {}).get("from_account") or source_account
+    db.setdefault("incoming_messages", {}).setdefault(chat_id, {})[message.id] = {
+        "from_account": account_number,
+        "time": datetime.now().isoformat(),
+        "text": message.text or message.caption or "[وسائط]"
+    }
+    save_data(db)
+
+    message_kind = "رد على رسالة البوت" if reply_info else "رسالة واردة في كروب مستهدف"
+    user_info = f"""
+📩 **{message_kind}**
+
+👤 **المرسل:**
+• الأيدي: {message.from_user.id}
+• اليوزر: @{message.from_user.username or 'لا يوجد'}
+• الاسم: {message.from_user.first_name} {message.from_user.last_name or ''}
+
+📍 **المكان:**
+• الكروب: {message.chat.title or 'بدون اسم'}
+• الأيدي: {message.chat.id}
+
+💬 **الرسالة:**
+{message.text or message.caption or '[وسائط]'}
+
+📋 **الحساب المقترح للرد:** {account_number or 'غير محدد'}
+🔄 **للرد:**
+/reply {message.from_user.id} {message.chat.id} {message.id} نص الرد
+"""
+    await app.send_message(OWNER_ID, user_info)
+
+
 async def start_userbot_monitor(session_str, index):
-    """تشغيل عميل لكل حساب لمراقبة رسائل البوتات في الكروبات"""
+    """تشغيل عميل لكل حساب لمراقبة الروابط والرسائل في الكروبات."""
     client = Client(f"userbot_{index}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
-    
+
     @client.on_message(filters.group & filters.incoming)
     async def userbot_message_handler(ub_client, message):
-        if not message.from_user or not message.from_user.is_bot:
+        if message.from_user and message.from_user.is_bot:
+            links = extract_all_links(message)
+            if links and db.get("auto_join_groups", True):
+                print(f"🤖 Userbot {index+1} found {len(links)} link(s); all accounts will join")
+                for link in links:
+                    await join_channel_for_all_accounts(link)
             return
-        print(f"🤖 Userbot {index+1} saw bot message from {message.from_user.username}")
-        links = extract_all_links(message)
-        if not links:
-            return
-        print(f"✅ Userbot {index+1} found links: {links}")
-        for link in links:
-            await join_channel_for_all_accounts(link)
-    
+        await forward_group_message_to_owner(message, index + 1)
+
     try:
         await client.start()
         print(f"✅ Userbot {index+1} started monitoring groups")
-        # إبقاء العميل حياً
         while True:
             await asyncio.sleep(3600)
     except Exception as e:
@@ -535,8 +641,9 @@ async def start_userbot_monitor(session_str, index):
     finally:
         await client.stop()
 
+
 async def start_all_userbots():
-    """تشغيل جميع حسابات المراقبة"""
+    """تشغيل جميع حسابات المراقبة."""
     global userbot_tasks
     userbot_tasks = []
     for idx, session_str in enumerate(db["accounts"]):
@@ -556,46 +663,10 @@ async def handle_bot_messages_with_links(client: Client, message: Message):
     for link in links:
         await join_channel_for_all_accounts(link)
 
-# --- Handle user replies to bot messages (in groups) ---
+# --- Handle incoming group messages and replies ---
 @app.on_message(filters.group & filters.incoming, group=1)
 async def handle_user_replies(client: Client, message: Message):
-    if not message.from_user or message.from_user.is_bot:
-        return
-    replied_message = message.reply_to_message
-    if not replied_message or not replied_message.from_user:
-        return
-    chat_id = str(message.chat.id)
-    is_our_message = False
-    if chat_id in db.get("outgoing_messages", {}):
-        if replied_message.id in db["outgoing_messages"][chat_id]:
-            is_our_message = True
-    if not is_our_message:
-        return
-    user_info = f"""
-📩 **رد وارد على رسالة البوت**
-
-👤 **المرسل:**
-• الأيدي: `{message.from_user.id}`
-• اليوزر: @{message.from_user.username or 'لا يوجد'}
-• الاسم: {message.from_user.first_name} {message.from_user.last_name or ''}
-
-📍 **المكان:**
-• النوع: كروب
-• الأيدي: `{message.chat.id}`
-• الاسم: {message.chat.title or 'بدون اسم'}
-
-💬 **الرسالة:**
-{message.text or message.caption or '[وسائط]'}
-
-📋 **معلومات الرسالة:**
-• الحساب المرسل: {db['outgoing_messages'][chat_id][replied_message.id].get('from_account', '؟')}
-• وقت الإرسال: {db['outgoing_messages'][chat_id][replied_message.id].get('time', '؟')}
-• الكليشة: {db['outgoing_messages'][chat_id][replied_message.id].get('template', '؟')[:50]}...
-
-🔄 **للرد:** أرسل رسالة تحتوي على:
-`/reply {message.from_user.id} {message.chat.id} {message.id} رسالتك`
-"""
-    await app.send_message(OWNER_ID, user_info)
+    await forward_group_message_to_owner(message)
 
 # --- Handle private messages from users (non-owner) ---
 @app.on_message(filters.private & filters.incoming & ~filters.user(OWNER_ID), group=2)
@@ -627,36 +698,6 @@ async def handle_owner_commands(client: Client, message: Message):
     text = message.text.strip()
     user_id_str = str(OWNER_ID)
 
-    if text.startswith("/reply"):
-        parts = text.split(maxsplit=3)
-        if len(parts) >= 4:
-            try:
-                user_id = int(parts[1])
-                chat_id = int(parts[2])
-                reply_text = parts[3]
-                account_number = None
-                if str(chat_id) in db.get("outgoing_messages", {}):
-                    for msg_id, msg_info in db["outgoing_messages"][str(chat_id)].items():
-                        if int(msg_id) == int(parts[2]) or True:
-                            account_number = msg_info.get("from_account")
-                            break
-                if account_number:
-                    account_index = account_number - 1
-                    if account_index < len(db["accounts"]):
-                        session_str = db["accounts"][account_index]
-                        user_client = Client(f"reply_client_{account_index}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
-                        await user_client.start()
-                        await user_client.send_message(chat_id, reply_text, reply_to_message_id=int(parts[2]))
-                        await user_client.stop()
-                        await message.reply_text(f"✅ تم إرسال الرد من الحساب {account_number}")
-                    else:
-                        await message.reply_text("❌ الحساب غير موجود")
-                else:
-                    await message.reply_text("❌ لم يتم العثور على الحساب المرسل")
-            except Exception as e:
-                await message.reply_text(f"❌ خطأ: {e}")
-        return
-
     if text.startswith("/reply_private"):
         parts = text.split(maxsplit=2)
         if len(parts) >= 3:
@@ -667,6 +708,35 @@ async def handle_owner_commands(client: Client, message: Message):
                 await message.reply_text("✅ تم إرسال الرد")
             except Exception as e:
                 await message.reply_text(f"❌ خطأ: {e}")
+        return
+
+    if text.startswith("/reply"):
+        parts = text.split(maxsplit=4)
+        if len(parts) >= 5:
+            try:
+                user_id = int(parts[1])
+                chat_id = int(parts[2])
+                message_id = int(parts[3])
+                reply_text = parts[4]
+                msg_info = get_message_context(chat_id, message_id)
+                account_number = (msg_info or {}).get("from_account")
+                if account_number:
+                    account_index = account_number - 1
+                    if account_index < len(db["accounts"]):
+                        session_str = db["accounts"][account_index]
+                        user_client = Client(f"reply_client_{account_index}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
+                        await user_client.start()
+                        await user_client.send_message(chat_id, reply_text, reply_to_message_id=message_id)
+                        await user_client.stop()
+                        await message.reply_text(f"✅ تم إرسال الرد من الحساب {account_number}")
+                    else:
+                        await message.reply_text("❌ الحساب غير موجود")
+                else:
+                    await message.reply_text("❌ لم يتم العثور على الحساب المرسل لهذه الرسالة")
+            except Exception as e:
+                await message.reply_text(f"❌ خطأ: {e}")
+        else:
+            await message.reply_text("❌ الصيغة الصحيحة: /reply user_id chat_id message_id نص الرد")
         return
 
     if text.lower().startswith("/start"):
@@ -814,13 +884,13 @@ async def handle_owner_commands(client: Client, message: Message):
             return await message.reply_text(f"✅ تمت إضافة {added_count} كروب!")
 
         elif state == "WAITING_TIMER":
-            if text.isdigit() and 2 <= int(text) <= 86400:
+            if text.isdigit() and 1 <= int(text) <= 86400:
                 db["timer"] = int(text)
                 db["user_state"].pop(user_id_str, None)
                 save_data(db)
                 return await message.reply_text(f"✅ تم ضبط المؤقت على {text} ثانية")
             else:
-                return await message.reply_text("❌ أرسل رقمًا صحيحًا بين 2 و86400")
+                return await message.reply_text("❌ أرسل رقمًا صحيحًا بين 1 و86400")
 
     action = get_menu_action(text)
     if action:
@@ -926,7 +996,7 @@ async def handle_owner_commands(client: Client, message: Message):
         elif action == "timer":
             db["user_state"][user_id_str] = "WAITING_TIMER"
             save_data(db)
-            await message.reply_text(f"⏱ المؤقت الحالي: {db.get('timer', 60)} ثانية\nأرسل القيمة الجديدة (بالثواني، حد أدنى 2):")
+            await message.reply_text(f"⏱ المؤقت الحالي: {db.get('timer', 60)} ثانية\nأرسل القيمة الجديدة (بالثواني، حد أدنى 1):")
 
         elif action == "stats":
             status = "🟢 يعمل" if db["is_running"] else "🔴 متوقف"
@@ -953,7 +1023,9 @@ async def handle_owner_commands(client: Client, message: Message):
             db["channel_join_time"] = {}
             db["account_errors"] = {}
             db["last_group_index"] = {}
+            db["last_sent_group_index"] = -1
             db["template_index"] = 0
+            db["incoming_messages"] = {}
             save_data(db)
             globals()['account_cache'] = {}
             await message.reply_text("🗑 تم حذف جميع الحسابات والكليشات والكروبات والقنوات الإجبارية.")
