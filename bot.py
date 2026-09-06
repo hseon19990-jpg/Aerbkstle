@@ -53,6 +53,8 @@ def load_data():
             "templates": [],
             "groups": [],
             "group_activity": {},
+            "incoming_activity": {},
+            "group_chat_ids": {},
             "timer": 60,
             "is_running": False,
             "stats": {"sent_count": 0, "failed_count": 0},
@@ -102,6 +104,8 @@ db.setdefault("template_index", 0)
 db.setdefault("incoming_messages", {})
 db.setdefault("account_blocked_groups", {})
 db.setdefault("auto_join_groups", True)
+db.setdefault("incoming_activity", {})
+db.setdefault("group_chat_ids", {})
 
 # --- Bot Client ---
 app = Client("auto_post_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
@@ -229,38 +233,53 @@ def get_account_group_blocks(account_number):
     return blocks
 
 
+def parse_activity_time(value):
+    """تحويل وقت التفاعل إلى قيمة قابلة للمقارنة مع دعم البيانات القديمة."""
+    if not value or isinstance(value, (int, float)):
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value))
+        if parsed.tzinfo:
+            parsed = parsed.replace(tzinfo=None)
+        return parsed
+    except (TypeError, ValueError):
+        return None
+
+
 def get_next_group(account_number=None):
-    """اختيار الكروب التالي وتجاوز التجميد المؤقت فقط."""
+    """اختيار الكروب صاحب أحدث تفاعل وارد مع احترام تجميد الحساب."""
     groups = db.get("groups", [])
     if not groups:
         return None
+
     blocked = get_account_group_blocks(account_number) if account_number else {}
     now = datetime.now()
     expired = []
-    last_index = db.get("last_sent_group_index", -1)
-    if not isinstance(last_index, int) or last_index < -1:
-        last_index = -1
-    for offset in range(len(groups)):
-        candidate_index = (last_index + 1 + offset) % len(groups)
-        candidate = groups[candidate_index]
-        retry_until = blocked.get(candidate)
+    available = []
+    incoming_activity = db.setdefault("incoming_activity", {})
+
+    for group in groups:
+        retry_until = blocked.get(group)
         if retry_until:
             try:
                 if datetime.fromisoformat(retry_until) > now:
                     continue
-                expired.append(candidate)
+                expired.append(group)
             except (TypeError, ValueError):
-                expired.append(candidate)
-        return_candidate = candidate
-        break
-    else:
-        return_candidate = None
+                expired.append(group)
+
+        activity_time = parse_activity_time(incoming_activity.get(group))
+        if activity_time:
+            available.append((group, activity_time))
 
     for group in expired:
         blocked.pop(group, None)
     if expired:
         save_data(db)
-    return return_candidate
+
+    if not available:
+        return None
+    return max(available, key=lambda item: item[1])[0]
 
 
 def advance_group_after_attempt(group):
@@ -299,11 +318,10 @@ def block_account_from_group(account_number, group):
 
 
 def mark_group_sent(group):
-    """حفظ آخر كروب تم الإرسال إليه فعلاً."""
+    """حفظ آخر كروب تم الإرسال إليه دون اعتباره تفاعلاً من المستخدمين."""
     groups = db.get("groups", [])
     if group in groups:
         db["last_sent_group_index"] = groups.index(group)
-        db.setdefault("group_activity", {})[group] = datetime.now().isoformat()
         save_data(db)
 
 
@@ -426,6 +444,11 @@ async def join_channel_for_all_accounts(channel, track_for_auto_leave=True):
             user_app = Client(f"reply_session_{idx}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
             await user_app.start()
             try:
+                chat_info = await user_app.get_chat(clean_link)
+                db.setdefault("group_chat_ids", {})[clean_link] = str(chat_info.id)
+            except Exception:
+                pass
+            try:
                 await user_app.join_chat(clean_link)
                 joined_any = True
                 print(f"✅ Acc {idx+1} joined {clean_link}")
@@ -444,6 +467,8 @@ async def join_channel_for_all_accounts(channel, track_for_auto_leave=True):
                     await user_app.stop()
                 except Exception:
                     pass
+    if joined_any:
+        save_data(db)
     if joined_any and track_for_auto_leave:
         join_time = datetime.now().isoformat()
         db["joined_channels"][clean_link] = join_time
@@ -644,11 +669,43 @@ def get_outgoing_message_context(chat_id, message_id):
     return chat_messages.get(message_id) or chat_messages.get(str(message_id))
 
 
+def get_configured_group_for_chat(chat):
+    """مطابقة دردشة تيليغرام مع الكروب المسجل حتى مع اختلاف صيغة الرابط."""
+    if not chat:
+        return None
+    chat_id = str(getattr(chat, "id", ""))
+    username = (getattr(chat, "username", None) or "").casefold()
+    known_chat_ids = db.get("group_chat_ids", {})
+
+    for group in db.get("groups", []):
+        clean_group = clean_group_link(group)
+        if clean_group == chat_id:
+            return group
+        if username and clean_group.casefold() == f"@{username}":
+            return group
+        if str(known_chat_ids.get(clean_group, "")) == chat_id:
+            return group
+    return None
+
+
+def record_group_interaction(message):
+    """تسجيل آخر رسالة من مستخدم حتى يذهب الإرسال للكروب الأكثر نشاطاً."""
+    if not message.from_user or message.from_user.is_bot:
+        return
+    group = get_configured_group_for_chat(message.chat)
+    if not group:
+        return
+    db.setdefault("incoming_activity", {})[group] = datetime.now().isoformat()
+    save_data(db)
+    print(f"🔥 Latest group interaction: {group}")
+
+
 async def forward_group_message_to_owner(message, source_account=None):
-    """حفظ الردود المباشرة على رسائل الحسابات فقط، بدون إرسال إشعار تلقائي."""
+    """تسجيل التفاعل وحفظ الردود المباشرة على رسائل الحسابات فقط."""
     if not message.from_user or message.from_user.is_bot:
         return
 
+    record_group_interaction(message)
     chat_id = str(message.chat.id)
     replied = message.reply_to_message
     if not replied:
