@@ -558,44 +558,46 @@ def get_message_context(chat_id, message_id):
     return None
 
 
-def is_configured_group(message):
-    chat_id = str(getattr(message.chat, "id", ""))
-    username = getattr(message.chat, "username", None)
-    possible_names = {chat_id}
-    if username:
-        possible_names.update({username, f"@{username}"})
-    return any(clean_group_link(group) in possible_names for group in db.get("groups", []))
+def get_outgoing_message_context(chat_id, message_id):
+    """العثور فقط على رسالة أرسلها أحد الحسابات، وليس رسالة واردة من مستخدم."""
+    chat_messages = db.get("outgoing_messages", {}).get(str(chat_id), {})
+    return chat_messages.get(message_id) or chat_messages.get(str(message_id))
 
 
 async def forward_group_message_to_owner(message, source_account=None):
-    """تحويل الردود والرسائل العادية من الكروبات للمالك مرة واحدة فقط."""
+    """حفظ الردود المباشرة على رسائل الحسابات فقط، بدون إرسال إشعار تلقائي."""
     if not message.from_user or message.from_user.is_bot:
         return
 
     chat_id = str(message.chat.id)
     replied = message.reply_to_message
-    reply_info = get_message_context(chat_id, replied.id) if replied else None
-    if not reply_info and not is_configured_group(message):
+    if not replied:
+        return
+
+    # لا نحتسب إلا الرد على رسالة مرسلة من أحد حساباتنا
+    reply_info = get_outgoing_message_context(chat_id, replied.id)
+    if not reply_info:
         return
 
     key = (chat_id, message.id)
     if key in forwarded_incoming:
-        # قد يصل الإشعار أولاً من البوت الرئيسي بلا رقم الحساب؛ حدّثه عند وصول userbot
         if source_account:
             saved_incoming = db.get("incoming_messages", {}).get(chat_id, {}).get(message.id)
             if saved_incoming is None:
                 saved_incoming = db.get("incoming_messages", {}).get(chat_id, {}).get(str(message.id))
             if saved_incoming and not saved_incoming.get("from_account"):
-                saved_incoming["from_account"] = source_account
+                saved_incoming["from_account"] = reply_info.get("from_account") or source_account
                 save_data(db)
         return
     forwarded_incoming.add(key)
     if len(forwarded_incoming) > 5000:
         forwarded_incoming.clear()
 
-    account_number = (reply_info or {}).get("from_account") or source_account
+    account_number = reply_info.get("from_account") or source_account
     incoming = db.setdefault("incoming_messages", {}).setdefault(chat_id, {})
     incoming[message.id] = {
+        "is_reply": True,
+        "reply_to_message_id": replied.id,
         "from_account": account_number,
         "time": datetime.now().isoformat(),
         "text": message.text or message.caption or "[وسائط]",
@@ -605,24 +607,7 @@ async def forward_group_message_to_owner(message, source_account=None):
         "chat_title": message.chat.title or "بدون اسم"
     }
     save_data(db)
-
-    message_kind = "رد على رسالة البوت" if reply_info else "رسالة واردة في كروب مستهدف"
-    user_info = f"""
-📩 **{message_kind}**
-
-👤 المرسل: @{message.from_user.username or 'لا يوجد'}
-📍 الكروب: {message.chat.title or 'بدون اسم'}
-
-اضغط الزر أدناه لعرض نص الرد ومعرفة الحساب الذي أرسل الرسالة.
-"""
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton(
-            "📩 عرض الرد والحساب",
-            callback_data=f"incoming_{chat_id}_{message.id}"
-        )]
-    ])
-    await app.send_message(OWNER_ID, user_info, reply_markup=keyboard)
-
+    print(f"📩 Saved reply from {message.from_user.id} in {chat_id} for account {account_number}")
 
 async def start_userbot_monitor(session_str, index):
     """تشغيل عميل لكل حساب لمراقبة الروابط والرسائل في الكروبات."""
@@ -1039,17 +1024,13 @@ async def handle_owner_commands(client: Client, message: Message):
             await message.reply_text("🗑 تم حذف جميع الحسابات والكليشات والكروبات والقنوات الإجبارية.")
 
         elif action == "incoming_replies":
-            if not db.get("outgoing_messages", {}):
-                return await message.reply_text("❌ لا توجد ردود واردة.")
-            msg = "👥 الردود الواردة:\n\n"
-            for chat_id, messages in db["outgoing_messages"].items():
-                for msg_id, msg_info in messages.items():
-                    msg += f"📍 كروب: {chat_id}\n"
-                    msg += f"💬 رسالة ID: {msg_id}\n"
-                    msg += f"🤖 حساب: {msg_info.get('from_account', '؟')}\n"
-                    msg += f"⏰ وقت: {msg_info.get('time', '؟')}\n"
-                    msg += "---\n"
-            await message.reply_text(msg)
+            keyboard = build_incoming_replies_keyboard()
+            if not keyboard:
+                return await message.reply_text("❌ لا توجد ردود واردة على رسائل حساباتك.")
+            await message.reply_text(
+                "👥 اختر الرد الذي تريد عرضه ومعرفة الحساب الذي أرسل الرسالة:",
+                reply_markup=keyboard
+            )
 
         elif action == "reply_status":
             status = "🟢 يعمل" if db["is_running"] else "🔴 متوقف"
@@ -1073,6 +1054,24 @@ async def handle_owner_commands(client: Client, message: Message):
 
     await message.reply_text("لم أفهم الأمر. أرسل /start ثم اختر أحد أزرار القائمة.")
 
+def build_incoming_replies_keyboard():
+    """إنشاء قائمة أزرار للردود المباشرة على رسائل الحسابات."""
+    keyboard = []
+    for chat_id, messages in db.get("incoming_messages", {}).items():
+        for msg_id, msg_info in messages.items():
+            if not msg_info.get("is_reply", False):
+                continue
+            sender = msg_info.get("from_username") or msg_info.get("from_name") or "مستخدم"
+            account = msg_info.get("from_account") or "؟"
+            label = f"📩 {sender[:18]} | الحساب {account} | {str(chat_id)[-8:]}"
+            callback_data = f"incoming_{chat_id}_{msg_id}"
+            if len(callback_data.encode("utf-8")) <= 64:
+                keyboard.append([InlineKeyboardButton(label[:60], callback_data=callback_data)])
+    if keyboard:
+        keyboard.append([InlineKeyboardButton("🔄 تحديث القائمة", callback_data="incoming_list")])
+    return InlineKeyboardMarkup(keyboard) if keyboard else None
+
+
 # --- Selection Helper ---
 def create_selection_list(items, item_type, action):
     keyboard = []
@@ -1092,6 +1091,14 @@ async def handle_callback(client: Client, callback_query):
     if data == "cancel":
         await callback_query.message.delete()
         return
+    if data == "incoming_list":
+        keyboard = build_incoming_replies_keyboard()
+        if not keyboard:
+            return await callback_query.message.reply_text("❌ لا توجد ردود واردة على رسائل حساباتك.")
+        return await callback_query.message.reply_text(
+            "👥 اختر الرد الذي تريد عرضه:",
+            reply_markup=keyboard
+        )
     if data.startswith("incoming_"):
         try:
             _, chat_id_raw, message_id_raw = data.split("_", 2)
@@ -1127,7 +1134,10 @@ async def handle_callback(client: Client, callback_query):
 🔄 **للرد من نفس الحساب أرسل:**
 /reply {msg_info.get('from_user_id', '')} {chat_id} {message_id} نص الرد
 """
-            await callback_query.message.reply_text(details)
+            await callback_query.message.reply_text(
+                details,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ الرجوع للردود", callback_data="incoming_list")]])
+            )
         except Exception as e:
             await callback_query.message.reply_text(f"❌ تعذر عرض الرد: {e}")
         return
