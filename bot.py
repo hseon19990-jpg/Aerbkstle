@@ -459,6 +459,11 @@ async def join_channel_for_all_accounts(channel, track_for_auto_leave=True):
                     print(f"✅ Acc {idx+1} is already in {clean_link}")
                 else:
                     print(f"❌ Acc {idx+1} failed to join {clean_link}: {e}")
+            try:
+                chat_info = await user_app.get_chat(clean_link)
+                db.setdefault("group_chat_ids", {})[clean_link] = str(chat_info.id)
+            except Exception:
+                pass
         except Exception as e:
             print(f"❌ Error opening acc {idx+1} for {clean_link}: {e}")
         finally:
