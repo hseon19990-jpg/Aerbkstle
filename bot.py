@@ -580,16 +580,29 @@ async def forward_group_message_to_owner(message, source_account=None):
 
     key = (chat_id, message.id)
     if key in forwarded_incoming:
+        # قد يصل الإشعار أولاً من البوت الرئيسي بلا رقم الحساب؛ حدّثه عند وصول userbot
+        if source_account:
+            saved_incoming = db.get("incoming_messages", {}).get(chat_id, {}).get(message.id)
+            if saved_incoming is None:
+                saved_incoming = db.get("incoming_messages", {}).get(chat_id, {}).get(str(message.id))
+            if saved_incoming and not saved_incoming.get("from_account"):
+                saved_incoming["from_account"] = source_account
+                save_data(db)
         return
     forwarded_incoming.add(key)
     if len(forwarded_incoming) > 5000:
         forwarded_incoming.clear()
 
     account_number = (reply_info or {}).get("from_account") or source_account
-    db.setdefault("incoming_messages", {}).setdefault(chat_id, {})[message.id] = {
+    incoming = db.setdefault("incoming_messages", {}).setdefault(chat_id, {})
+    incoming[message.id] = {
         "from_account": account_number,
         "time": datetime.now().isoformat(),
-        "text": message.text or message.caption or "[وسائط]"
+        "text": message.text or message.caption or "[وسائط]",
+        "from_user_id": message.from_user.id,
+        "from_username": message.from_user.username or "",
+        "from_name": f"{message.from_user.first_name} {message.from_user.last_name or ''}".strip(),
+        "chat_title": message.chat.title or "بدون اسم"
     }
     save_data(db)
 
@@ -597,23 +610,18 @@ async def forward_group_message_to_owner(message, source_account=None):
     user_info = f"""
 📩 **{message_kind}**
 
-👤 **المرسل:**
-• الأيدي: {message.from_user.id}
-• اليوزر: @{message.from_user.username or 'لا يوجد'}
-• الاسم: {message.from_user.first_name} {message.from_user.last_name or ''}
+👤 المرسل: @{message.from_user.username or 'لا يوجد'}
+📍 الكروب: {message.chat.title or 'بدون اسم'}
 
-📍 **المكان:**
-• الكروب: {message.chat.title or 'بدون اسم'}
-• الأيدي: {message.chat.id}
-
-💬 **الرسالة:**
-{message.text or message.caption or '[وسائط]'}
-
-📋 **الحساب المقترح للرد:** {account_number or 'غير محدد'}
-🔄 **للرد:**
-/reply {message.from_user.id} {message.chat.id} {message.id} نص الرد
+اضغط الزر أدناه لعرض نص الرد ومعرفة الحساب الذي أرسل الرسالة.
 """
-    await app.send_message(OWNER_ID, user_info)
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            "📩 عرض الرد والحساب",
+            callback_data=f"incoming_{chat_id}_{message.id}"
+        )]
+    ])
+    await app.send_message(OWNER_ID, user_info, reply_markup=keyboard)
 
 
 async def start_userbot_monitor(session_str, index):
@@ -1083,6 +1091,45 @@ async def handle_callback(client: Client, callback_query):
     await callback_query.answer()
     if data == "cancel":
         await callback_query.message.delete()
+        return
+    if data.startswith("incoming_"):
+        try:
+            _, chat_id_raw, message_id_raw = data.split("_", 2)
+            chat_id = int(chat_id_raw)
+            message_id = int(message_id_raw)
+            msg_info = get_message_context(chat_id, message_id)
+            if not msg_info:
+                return await callback_query.message.reply_text("❌ انتهت بيانات هذه الرسالة أو لم تعد موجودة.")
+
+            account_number = msg_info.get("from_account")
+            account_label = f"الحساب رقم {account_number}" if account_number else "غير محدد"
+            if account_number and 0 < int(account_number) <= len(db.get("accounts", [])):
+                account_info = await get_account_info(db["accounts"][int(account_number) - 1], int(account_number) - 1)
+                account_label += f"\n📱 الرقم: {account_info.get('phone', 'غير معروف')}\n👤 الاسم: {account_info.get('name', 'غير معروف')}"
+
+            sender_name = msg_info.get("from_name") or "غير معروف"
+            sender_username = msg_info.get("from_username") or "لا يوجد"
+            reply_text = msg_info.get("text") or "[وسائط أو رسالة بدون نص]"
+            details = f"""
+📩 **تفاصيل الرد**
+
+👤 المرسل: {sender_name}
+🔹 اليوزر: @{sender_username}
+📍 الكروب: {msg_info.get('chat_title', 'بدون اسم')}
+🆔 أيدي الكروب: {chat_id}
+
+💬 **نص الرد:**
+{reply_text}
+
+📱 **الحساب الذي أرسل الرسالة الأصلية:**
+{account_label}
+
+🔄 **للرد من نفس الحساب أرسل:**
+/reply {msg_info.get('from_user_id', '')} {chat_id} {message_id} نص الرد
+"""
+            await callback_query.message.reply_text(details)
+        except Exception as e:
+            await callback_query.message.reply_text(f"❌ تعذر عرض الرد: {e}")
         return
     if data.startswith("delete_template_"):
         index = int(data.split("_")[2])
