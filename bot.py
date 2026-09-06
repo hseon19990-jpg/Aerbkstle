@@ -408,15 +408,16 @@ def ensure_auto_leave_task():
         auto_leave_task = asyncio.create_task(auto_leave_channels())
 
 # --- Join channel for all accounts ---
-async def join_channel_for_all_accounts(channel):
+async def join_channel_for_all_accounts(channel, track_for_auto_leave=True):
     clean_link = clean_group_link(channel)
     if not clean_link:
         return
-    if clean_link in db.get("joined_channels", {}):
+    if track_for_auto_leave and clean_link in db.get("joined_channels", {}):
         print(f"⏭️ Already tracking {clean_link}")
         return
 
-    ensure_auto_leave_task()
+    if track_for_auto_leave:
+        ensure_auto_leave_task()
     joined_any = False
     print(f"📢 Joining {clean_link} for all accounts...")
     for idx, session_str in enumerate(db["accounts"]):
@@ -443,12 +444,14 @@ async def join_channel_for_all_accounts(channel):
                     await user_app.stop()
                 except Exception:
                     pass
-    if joined_any:
+    if joined_any and track_for_auto_leave:
         join_time = datetime.now().isoformat()
         db["joined_channels"][clean_link] = join_time
         db["channel_join_time"][clean_link] = join_time
         save_data(db)
         print(f"✅ Channel {clean_link} registered for auto-leave in 24 hours")
+    elif joined_any:
+        print(f"✅ All accounts checked/joined posting group {clean_link}; it will remain in the list")
 
 # --- 🚀 MAIN POSTING LOOP ---
 async def ensure_account_in_group(client, group, account_number):
@@ -942,6 +945,7 @@ async def handle_owner_commands(client: Client, message: Message):
         elif state == "WAITING_GROUP":
             lines = text.strip().split('\n')
             added_count = 0
+            new_groups = []
             for line in lines:
                 if line.strip():
                     group = clean_group_link(line.strip())
@@ -953,10 +957,13 @@ async def handle_owner_commands(client: Client, message: Message):
                                 blocked_groups.pop(group, None)
                             elif group in blocked_groups:
                                 blocked_groups.remove(group)
+                        new_groups.append(group)
                         added_count += 1
             db["user_state"].pop(user_id_str, None)
             save_data(db)
-            return await message.reply_text(f"✅ تمت إضافة {added_count} كروب!")
+            for group in new_groups:
+                await join_channel_for_all_accounts(group, track_for_auto_leave=False)
+            return await message.reply_text(f"✅ تمت إضافة {added_count} كروب، وتم فحص انضمام جميع الحسابات تلقائيًا!")
 
         elif state == "WAITING_TIMER":
             if text.isdigit() and 1 <= int(text) <= 86400:
