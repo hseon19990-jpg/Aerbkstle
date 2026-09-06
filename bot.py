@@ -66,6 +66,7 @@ def load_data():
             "last_sent_group_index": -1,
             "template_index": 0,
             "incoming_messages": {},
+            "account_blocked_groups": {},
             "auto_join_groups": True
         }
         os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
@@ -99,6 +100,7 @@ db.setdefault("last_group_index", {})
 db.setdefault("last_sent_group_index", -1)
 db.setdefault("template_index", 0)
 db.setdefault("incoming_messages", {})
+db.setdefault("account_blocked_groups", {})
 db.setdefault("auto_join_groups", True)
 
 # --- Bot Client ---
@@ -212,15 +214,64 @@ def clean_group_link(link):
         link = f"@{link}"
     return link
 
-def get_next_group(account_index=None):
-    """اختيار الكروب التالي بعد آخر كروب نجح فيه الإرسال لجميع الحسابات."""
+def get_next_group(account_number=None):
+    """اختيار الكروب التالي بعد آخر إرسال مع تجاهل الكروبات المحظورة لهذا الحساب."""
     groups = db.get("groups", [])
     if not groups:
         return None
+    blocked = set(db.get("account_blocked_groups", {}).get(str(account_number), [])) if account_number else set()
     last_index = db.get("last_sent_group_index", -1)
     if not isinstance(last_index, int) or last_index < -1:
         last_index = -1
-    return groups[(last_index + 1) % len(groups)]
+    for offset in range(len(groups)):
+        candidate_index = (last_index + 1 + offset) % len(groups)
+        candidate = groups[candidate_index]
+        if candidate not in blocked:
+            return candidate
+    return None
+
+
+def advance_group_after_attempt(group):
+    """تحريك المؤشر بعد الفشل حتى لا تتكرر نفس المجموعة مع كل الحسابات."""
+    groups = db.get("groups", [])
+    if group in groups:
+        db["last_sent_group_index"] = groups.index(group)
+        save_data(db)
+
+
+PERMANENT_GROUP_ERRORS = (
+    "CHAT_WRITE_FORBIDDEN",
+    "CHAT_ADMIN_REQUIRED",
+    "CHAT_RESTRICTED",
+    "CHANNEL_PRIVATE",
+    "USER_BANNED_IN_CHANNEL",
+    "PEER_ID_INVALID",
+    "USERNAME_INVALID",
+    "ID NOT FOUND",
+    "MESSAGE_SEND_FAILED"
+)
+
+
+def is_permanent_group_error(error_text):
+    text = str(error_text).upper()
+    return any(marker in text for marker in PERMANENT_GROUP_ERRORS)
+
+
+def block_account_from_group(account_number, group):
+    """حظر الكروب لهذا الحساب فقط، وحذفه إذا عجزت عنه كل الحسابات."""
+    blocked = db.setdefault("account_blocked_groups", {}).setdefault(str(account_number), [])
+    if group not in blocked:
+        blocked.append(group)
+
+    account_count = len(db.get("accounts", []))
+    blocked_by_all = account_count > 0 and all(
+        group in db.get("account_blocked_groups", {}).get(str(index), [])
+        for index in range(1, account_count + 1)
+    )
+    if blocked_by_all and group in db.get("groups", []):
+        db["groups"].remove(group)
+        print(f"🧹 Removed group with no writable account: {group}")
+    save_data(db)
 
 
 def mark_group_sent(group):
@@ -237,6 +288,7 @@ def get_next_template():
     if not templates:
         return None
     return random.choice(templates)
+
 
 # --- Get account info with caching ---
 async def get_account_info(session_str, index):
@@ -376,26 +428,28 @@ async def join_channel_for_all_accounts(channel):
 
 # --- 🚀 MAIN POSTING LOOP ---
 async def ensure_account_in_group(client, group, account_number):
-    """التأكد من أن الحساب عضو في الكروب قبل إرسال الرسالة."""
+    """التأكد من العضوية قبل الإرسال وإرجاع ما إذا كان الخطأ دائمًا."""
     try:
         member = await client.get_chat_member(group, "me")
         status = getattr(member, "status", "")
         status = getattr(status, "value", status)
         if str(status).lower() not in ("left", "kicked", "banned"):
-            return True
+            return True, False
     except Exception:
+        # قد لا يكون الكروب محفوظًا في جلسة Pyrogram؛ نجرب الانضمام مباشرة
         pass
 
     try:
         await client.join_chat(group)
         print(f"✅ Account {account_number} joined {group} before posting")
-        return True
+        return True, False
     except Exception as e:
         error_text = str(e).upper()
         if "ALREADY_PARTICIPANT" in error_text or "USER_ALREADY_PARTICIPANT" in error_text:
-            return True
+            return True, False
+        permanent = is_permanent_group_error(error_text)
         print(f"❌ Account {account_number} could not join {group}: {e}")
-        return False
+        return False, permanent
 
 
 async def auto_posting_loop():
@@ -461,7 +515,7 @@ async def auto_posting_loop():
                 await asyncio.sleep(timer_value)
                 client = acc_info["client"]
                 acc_number = acc_info["number"]
-                group = get_next_group()
+                group = get_next_group(acc_number)
                 if group is None:
                     continue
                 template = get_next_template()
@@ -469,9 +523,12 @@ async def auto_posting_loop():
                     continue
 
                 try:
-                    if not await ensure_account_in_group(client, group, acc_number):
+                    joined, permanent_error = await ensure_account_in_group(client, group, acc_number)
+                    if not joined:
                         db["stats"]["failed_count"] += 1
-                        save_data(db)
+                        advance_group_after_attempt(group)
+                        if permanent_error:
+                            block_account_from_group(acc_number, group)
                         continue
 
                     status = await check_account_status(client, acc_number)
@@ -511,25 +568,21 @@ async def auto_posting_loop():
 
                 except UserBannedInChannel:
                     db["stats"]["failed_count"] += 1
-                    save_data(db)
                     error_msg = f"🚫 الحساب {acc_number} ممنوع في {group}"
                     print(f"❌ {error_msg}")
                     await notify_owner(error_msg)
-                    if group in db["groups"]:
-                        db["groups"].remove(group)
-                        save_data(db)
+                    advance_group_after_attempt(group)
+                    block_account_from_group(acc_number, group)
 
                 except Exception as e:
                     db["stats"]["failed_count"] += 1
-                    save_data(db)
                     error_text = str(e)
                     print(f"❌ Acc {acc_number} failed to send to {group}: {error_text}")
                     consecutive_errors[acc_number] += 1
-                    if "USERNAME_INVALID" in error_text or "PEER_ID_INVALID" in error_text:
-                        if group in db["groups"]:
-                            db["groups"].remove(group)
-                            save_data(db)
-                            print(f"🧹 Removed invalid group: {group}")
+                    advance_group_after_attempt(group)
+                    if is_permanent_group_error(error_text):
+                        block_account_from_group(acc_number, group)
+                        print(f"⏭️ Account {acc_number} will skip {group}: no send permission or invalid peer")
 
     except Exception as e:
         error_msg = f"❌ خطأ رئيسي في حلقة النشر: {str(e)}"
@@ -871,6 +924,9 @@ async def handle_owner_commands(client: Client, message: Message):
                     if group not in db["groups"]:
                         db["groups"].append(group)
                         db.setdefault("group_activity", {}).setdefault(group, 0)
+                        for blocked_groups in db.setdefault("account_blocked_groups", {}).values():
+                            if group in blocked_groups:
+                                blocked_groups.remove(group)
                         added_count += 1
             db["user_state"].pop(user_id_str, None)
             save_data(db)
@@ -1023,6 +1079,7 @@ async def handle_owner_commands(client: Client, message: Message):
             db["last_sent_group_index"] = -1
             db["template_index"] = 0
             db["incoming_messages"] = {}
+            db["account_blocked_groups"] = {}
             save_data(db)
             globals()['account_cache'] = {}
             await message.reply_text("🗑 تم حذف جميع الحسابات والكليشات والكروبات والقنوات الإجبارية.")
