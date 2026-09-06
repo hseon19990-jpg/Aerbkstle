@@ -952,11 +952,15 @@ async def handle_owner_commands(client: Client, message: Message):
             await message.reply_text("🗑 اختر الكروب لحذفه:", reply_markup=keyboard)
 
         elif action == "start":
+            global posting_task
             if db["is_running"]:
-                return await message.reply_text("⚠️ البوت يعمل حاليًا.")
+                # بعد إعادة التشغيل قد تبقى الراية محفوظة بينما لا توجد مهمة فعلية
+                if posting_task is not None and not posting_task.done():
+                    return await message.reply_text("⚠️ البوت يعمل حاليًا.")
+                db["is_running"] = False
+                save_data(db)
             if not db["accounts"] or not db["templates"] or not db["groups"]:
                 return await message.reply_text("❌ يجب إضافة حساب وكليشة وكروب أولًا.")
-            global posting_task
             db["is_running"] = True
             save_data(db)
             posting_task = asyncio.create_task(auto_posting_loop())
@@ -1227,8 +1231,16 @@ if __name__ == "__main__":
     print("  📱 Private message handling")
     print("  🛡️ Account ban/freeze monitoring")
     
-    # تشغيل مراقبة الحسابات (Userbots) أولاً
-    asyncio.get_event_loop().run_until_complete(start_all_userbots())
-    
+    async def startup_tasks():
+        global posting_task
+        await start_all_userbots()
+        # استئناف النشر إذا كان البوت يعمل قبل إعادة تشغيل الخدمة
+        if db.get("is_running") and db.get("accounts") and db.get("templates") and db.get("groups"):
+            posting_task = asyncio.create_task(auto_posting_loop())
+            print("🔄 Posting loop resumed after restart")
+
+    # تشغيل userbots واستئناف حلقة النشر قبل تشغيل البوت الرئيسي
+    asyncio.get_event_loop().run_until_complete(startup_tasks())
+
     # ثم تشغيل البوت الرئيسي
     app.run()
