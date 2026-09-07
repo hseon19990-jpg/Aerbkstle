@@ -64,6 +64,7 @@ def load_data():
             "outgoing_messages": {},
             "joined_channels": {},
             "channel_join_time": {},
+            "account_joined_channels": {},
             "account_errors": {},
             "last_group_index": {},
             "last_sent_group_index": -1,
@@ -101,6 +102,7 @@ db.setdefault("last_message", {})
 db.setdefault("outgoing_messages", {})
 db.setdefault("joined_channels", {})
 db.setdefault("channel_join_time", {})
+db.setdefault("account_joined_channels", {})
 db.setdefault("account_errors", {})
 db.setdefault("last_group_index", {})
 db.setdefault("last_sent_group_index", -1)
@@ -496,6 +498,8 @@ async def auto_leave_channels():
                 if success:
                     db["joined_channels"].pop(channel, None)
                     db["channel_join_time"].pop(channel, None)
+                    for account_channels in db.get("account_joined_channels", {}).values():
+                        account_channels.pop(channel, None)
                     save_data(db)
             await asyncio.sleep(3600)
         except Exception as e:
@@ -513,6 +517,12 @@ async def join_channel_for_account(session_str, account_index, channel):
     clean_link = clean_group_link(channel)
     if not clean_link:
         return False
+
+    account_key = str(account_index)
+    account_joined_channels = db.setdefault("account_joined_channels", {})
+    if account_joined_channels.get(account_key, {}).get(clean_link) is True:
+        print(f"⏭️ Acc {account_index + 1} already confirmed in {clean_link}")
+        return True
 
     user_app = None
     joined = False
@@ -541,6 +551,8 @@ async def join_channel_for_account(session_str, account_index, channel):
                 print(f"✅ Acc {account_index + 1} is already in {clean_link}")
             else:
                 print(f"❌ Acc {account_index + 1} failed to join {clean_link}: {error}")
+        if joined:
+            account_joined_channels.setdefault(account_key, {})[clean_link] = True
         try:
             chat_info = await user_app.get_chat(clean_link)
             db.setdefault("group_chat_ids", {})[clean_link] = str(chat_info.id)
@@ -558,13 +570,19 @@ async def join_channel_for_account(session_str, account_index, channel):
 
 
 async def join_account_to_configured_groups(session_str, account_index):
-    """عند إضافة رقم جديد، ينضم الحساب إلى كل الكروبات المسجلة."""
+    """عند إضافة رقم جديد، ينضم الحساب إلى كل الكروبات والقنوات الإجبارية."""
     groups = list(db.get("groups", []))
     joined_count = 0
     for group in groups:
         if await join_channel_for_account(session_str, account_index, group):
             joined_count += 1
-    if groups:
+
+    # القنوات الإجبارية ليست ضمن قائمة الكروبات، لذلك يجب ضم الحساب الجديد
+    # إليها أيضًا حتى لو تم اكتشافها قبل إضافة هذا الحساب.
+    for channel in list(db.get("joined_channels", {}).keys()):
+        await join_channel_for_account(session_str, account_index, channel)
+
+    if groups or db.get("joined_channels"):
         save_data(db)
     return joined_count, len(groups)
 
@@ -574,8 +592,7 @@ async def join_channel_for_all_accounts(channel, track_for_auto_leave=True):
     if not clean_link:
         return
     if track_for_auto_leave and clean_link in db.get("joined_channels", {}):
-        print(f"⏭️ Already tracking {clean_link}")
-        return
+        print(f"🔁 Rechecking mandatory channel {clean_link} for every account")
 
     if track_for_auto_leave:
         ensure_auto_leave_task()
@@ -776,6 +793,14 @@ async def auto_posting_loop():
             await notify_owner("🛑 تم إيقاف البوت تلقائياً بسبب خطأ")
 
 # ===== ⭐ جديد: مراقبة الحسابات (Userbots) لاستقبال رسائل البوتات في الكروبات =====
+def is_bot_generated_message(message):
+    """التعرف على رسائل البوتات حتى لو أرسلها مشرف مجهول أو قناة."""
+    sender = getattr(message, "from_user", None)
+    if sender and getattr(sender, "is_bot", False):
+        return True
+    return bool(getattr(message, "sender_chat", None))
+
+
 def get_message_context(chat_id, message_id):
     """العثور على معلومات الرسالة المرسلة أو المحفوظة من كروب."""
     for collection in ("outgoing_messages", "incoming_messages"):
@@ -888,7 +913,7 @@ async def start_userbot_monitor(session_str, index):
 
     @client.on_message(filters.group & filters.incoming)
     async def userbot_message_handler(ub_client, message):
-        if message.from_user and message.from_user.is_bot:
+        if is_bot_generated_message(message):
             links = extract_all_links(message)
             if links and db.get("auto_join_groups", True):
                 print(f"🤖 Userbot {index+1} found {len(links)} link(s); all accounts will join")
@@ -920,7 +945,7 @@ async def start_all_userbots():
 # --- ✅ المعالج الأهم والأول: أي رسالة من بوت تحتوي روابط (يعمل إذا كان البوت الرئيسي عضواً) ---
 @app.on_message(filters.group & filters.incoming, group=0)
 async def handle_bot_messages_with_links(client: Client, message: Message):
-    if not message.from_user or not message.from_user.is_bot:
+    if not is_bot_generated_message(message):
         return
     links = extract_all_links(message)
     if not links:
@@ -1490,6 +1515,8 @@ async def handle_callback(client: Client, callback_query):
             save_data(db)
             await callback_query.message.delete()
             globals()['account_cache'] = {}
+            db["account_joined_channels"] = {}
+            save_data(db)
         else:
             await callback_query.message.reply_text("❌ العنصر غير موجود.")
 
