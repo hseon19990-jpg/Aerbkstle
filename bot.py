@@ -583,45 +583,23 @@ async def get_group_dialog_states(client):
 
 
 def get_next_group(account_number=None, dialog_states=None):
-    """اختيار الكروب النشط صاحب أحدث رسالة."""
+    """اختيار الكروب التالي بالتناوب دون شروط نشاط أو رسائل غير مقروءة."""
     groups = db.get("groups", [])
     if not groups:
         return None
 
-    blocked = get_account_group_blocks(account_number) if account_number else {}
-    now = datetime.now()
-    expired = []
-    available = []
-    incoming_activity = db.setdefault("incoming_activity", {})
-
-    for group in groups:
-        retry_until = blocked.get(group)
-        if retry_until:
-            try:
-                if datetime.fromisoformat(retry_until) > now:
-                    continue
-                expired.append(group)
-            except (TypeError, ValueError):
-                expired.append(group)
-
-        state = (dialog_states or {}).get(group)
-        if not state:
-            continue
-        activity_time = parse_activity_time(state.get("last_message_time"))
-        if not activity_time:
-            continue
-        if not can_account_post_to_group(account_number, group, activity_time):
-            continue
-        available.append((group, activity_time))
-
-    for group in expired:
-        blocked.pop(group, None)
-    if expired:
-        save_data(db)
-
-    if not available:
-        return None
-    return max(available, key=lambda item: item[1])[0]
+    # لا ننتظر رسالة جديدة ولا unread count ولا عدد تفاعلات.
+    # كل حساب ينتقل إلى الكروب التالي في قائمته حتى تتم محاولة الإرسال
+    # إلى جميع الكروبات بالتناوب.
+    account_key = str(account_number or 0)
+    last_indices = db.setdefault("last_group_index", {})
+    try:
+        last_index = int(last_indices.get(account_key, -1))
+    except (TypeError, ValueError):
+        last_index = -1
+    next_index = (last_index + 1) % len(groups)
+    last_indices[account_key] = next_index
+    return groups[next_index]
 
 
 def advance_group_after_attempt(group):
@@ -968,13 +946,9 @@ async def auto_posting_loop():
                 client = acc_info["client"]
                 acc_number = acc_info["number"]
                 try:
-                    dialog_states = await get_group_dialog_states(client)
-                    group = get_next_group(acc_number, dialog_states)
+                    group = get_next_group(acc_number)
                     if group is None:
-                        print(
-                            f"⏭️ لا يوجد كروب نشط مؤهل للحساب {acc_number} "
-                            "أو لا يوجد نشاط أحدث من آخر إرسال"
-                        )
+                        print(f"⏭️ لا يوجد كروب مسجل للحساب {acc_number}")
                         continue
                     template = get_next_template()
                 except Exception as error:
@@ -1662,7 +1636,7 @@ async def handle_owner_commands(client: Client, message: Message):
                 f"📢 الكروبات: {len(db['groups'])}\n"
                 f"📝 الكليشات: {len(db['templates'])}\n"
                 f"🔄 طابور حسابات متكرر بالترتيب\n"
-                "🎯 اختيار الكروب الأحدث نشاطًا، مع منع إعادة الإرسال لنفس النشاط\n"
+                "🎯 إرسال بالتناوب إلى جميع الكروبات المسجلة دون شروط نشاط\n"
                 f"📡 مراقبة الحظر والتجميد مفعلة\n"
                 f"👥 نظام الردود الآلي مفعل"
             )
