@@ -4,6 +4,7 @@ import copy
 import json
 import random
 import re
+from contextvars import ContextVar
 from datetime import datetime, timedelta
 from pyrogram import Client, filters
 from pyrogram.types import ReplyKeyboardMarkup, KeyboardButton, Message, InlineKeyboardMarkup, InlineKeyboardButton
@@ -45,11 +46,12 @@ if missing_settings:
 # --- Data file ---
 DATA_FILE = "/app/data/bot_data.json"
 login_sessions = {}
-account_cache = {}
-posting_task = None
-auto_leave_task = None
-account_status = {}
-userbot_tasks = []  # لتخزين مهام مراقبة الحسابات
+profile_context = ContextVar("profile_context", default=None)
+profile_posting_tasks = {}
+profile_userbot_tasks = {}
+profile_auto_leave_tasks = {}
+profile_account_caches = {}
+profile_account_statuses = {}
 forwarded_incoming = set()  # منع تكرار تحويل نفس الرسالة للمالك
 group_message_keys = set()  # منع عدّ نفس الرسالة مرتين عند تعدد الحسابات
 
@@ -104,6 +106,72 @@ profile_store = {
 }
 
 
+def current_profile_id():
+    return profile_context.get() or profile_store.get("active_profile_id", "profile_1")
+
+
+def current_profile_record():
+    profile_id = current_profile_id()
+    profile = next((item for item in profile_store.get("profiles", []) if item.get("id") == profile_id), None)
+    if profile is None:
+        profile = profile_record(profile_id, "المجموعة 1", default_profile_data())
+        profile_store.setdefault("profiles", []).append(profile)
+    return profile
+
+
+class ProfileDBProxy:
+    """يوجه كل مهمة asyncio إلى بيانات ملف التشغيل الخاص بها."""
+    def _data(self):
+        return current_profile_record()["data"]
+
+    def __getitem__(self, key):
+        return self._data()[key]
+
+    def __setitem__(self, key, value):
+        self._data()[key] = value
+
+    def __delitem__(self, key):
+        del self._data()[key]
+
+    def __contains__(self, key):
+        return key in self._data()
+
+    def __iter__(self):
+        return iter(self._data())
+
+    def __len__(self):
+        return len(self._data())
+
+    def get(self, key, default=None):
+        return self._data().get(key, default)
+
+    def setdefault(self, key, default=None):
+        return self._data().setdefault(key, default)
+
+    def pop(self, key, *args):
+        return self._data().pop(key, *args)
+
+    def clear(self):
+        self._data().clear()
+
+    def keys(self):
+        return self._data().keys()
+
+    def items(self):
+        return self._data().items()
+
+    def values(self):
+        return self._data().values()
+
+
+def get_account_cache():
+    return profile_account_caches.setdefault(current_profile_id(), {})
+
+
+def get_account_status_cache():
+    return profile_account_statuses.setdefault(current_profile_id(), {})
+
+
 def profile_record(profile_id, name, data):
     return {
         "id": profile_id,
@@ -150,55 +218,28 @@ def load_data():
     profile_store["active_profile_id"] = "profile_1"
     return legacy_data
 
-def save_data(data):
+def save_data(data=None):
+    if data is None or isinstance(data, ProfileDBProxy):
+        data = current_profile_record()["data"]
     ensure_profile_data(data)
-    active_id = profile_store.get("active_profile_id", "profile_1")
-    active_profile = next(
-        (item for item in profile_store.get("profiles", []) if item["id"] == active_id),
-        None
-    )
+    active_id = current_profile_id()
+    active_profile = next((item for item in profile_store.get("profiles", []) if item["id"] == active_id), None)
     if active_profile is None:
         active_profile = profile_record(active_id, "المجموعة 1", data)
         profile_store.setdefault("profiles", []).append(active_profile)
     active_profile["data"] = data
     payload = {
         "schema_version": 2,
-        "active_profile_id": active_id,
+        "active_profile_id": profile_store.get("active_profile_id", active_id),
         "profiles": profile_store.get("profiles", [])
     }
     os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=4)
 
-db = load_data()
-db.setdefault("accounts", [])
-db.setdefault("templates", [])
-db.setdefault("groups", [])
-db.setdefault("group_activity", {})
-db.setdefault("timer", 60)
-db.setdefault("is_running", False)
-db.setdefault("stats", {"sent_count": 0, "failed_count": 0})
-db["stats"].setdefault("sent_count", 0)
-db["stats"].setdefault("failed_count", 0)
-db.setdefault("user_state", {})
-db.setdefault("last_message", {})
-db.setdefault("outgoing_messages", {})
-db.setdefault("joined_channels", {})
-db.setdefault("channel_join_time", {})
-db.setdefault("account_joined_channels", {})
-db.setdefault("account_errors", {})
-db.setdefault("last_group_index", {})
-db.setdefault("last_sent_group_index", -1)
-db.setdefault("template_index", 0)
-db.setdefault("incoming_messages", {})
-db.setdefault("account_blocked_groups", {})
-db.setdefault("account_group_posts", {})
-db.setdefault("account_group_incoming", {})
-db.setdefault("account_group_last_sent", {})
-db.setdefault("group_unread_counts", {})
-db.setdefault("auto_join_groups", True)
-db.setdefault("incoming_activity", {})
-db.setdefault("group_chat_ids", {})
+load_data()
+db = ProfileDBProxy()
+ensure_profile_data(db._data())
 
 # --- Bot profiles / groups ---
 def get_active_profile():
@@ -241,8 +282,11 @@ def profile_menu_text():
     active_name = active.get("name", "المجموعة 1") if active else "المجموعة 1"
     lines = ["🤖 مجموعات البوت", "", f"📂 المجموعة الحالية: {active_name}", ""]
     for index, profile in enumerate(profile_store.get("profiles", []), 1):
-        marker = "✅" if profile.get("id") == profile_store.get("active_profile_id") else "📁"
-        lines.append(f"{marker} {index}. {profile.get('name', f'المجموعة {index}')}")
+        profile_data = profile.get("data", {})
+        is_running = bool(profile_data.get("is_running"))
+        marker = "🟢" if is_running else ("✅" if profile.get("id") == profile_store.get("active_profile_id") else "📁")
+        status = "يعمل" if is_running else "متوقف"
+        lines.append(f"{marker} {index}. {profile.get('name', f'المجموعة {index}')} — {status}")
     lines.append("")
     lines.append("اختر مجموعة لفتح إعداداتها.")
     return "\n".join(lines)
@@ -263,10 +307,10 @@ async def show_profile_menu(message):
     )
 
 
-async def stop_all_userbots():
-    global userbot_tasks
-    tasks = list(userbot_tasks)
-    userbot_tasks = []
+async def stop_all_userbots(profile_id=None):
+    profile_id = profile_id or current_profile_id()
+    tasks = list(profile_userbot_tasks.get(profile_id, []))
+    profile_userbot_tasks[profile_id] = []
     for task in tasks:
         task.cancel()
     if tasks:
@@ -274,18 +318,16 @@ async def stop_all_userbots():
 
 
 async def activate_profile(index):
-    global db, account_cache, account_status
     profiles = profile_store.get("profiles", [])
     if not 0 <= index < len(profiles):
         return False
     selected = profiles[index]
     profile_store["active_profile_id"] = selected["id"]
-    db = ensure_profile_data(copy.deepcopy(selected["data"]))
-    account_cache = {}
-    account_status = {}
-    save_data(db)
-    await stop_all_userbots()
-    await start_all_userbots()
+    profile_context.set(selected["id"])
+    get_account_cache().clear()
+    get_account_status_cache().clear()
+    ensure_profile_data(selected["data"])
+    save_data()
     return True
 
 
@@ -655,10 +697,11 @@ def get_next_template():
 # --- Get account info with caching ---
 async def get_account_info(session_str, index):
     cache_key = f"{index}_{hash(session_str)}"
-    if cache_key in account_cache:
-        return account_cache[cache_key]
+    cache = get_account_cache()
+    if cache_key in cache:
+        return cache[cache_key]
     try:
-        temp_client = Client(f"info_session_{index}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
+        temp_client = Client(f"info_session_{current_profile_id()}_{index}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
         await temp_client.connect()
         me = await temp_client.get_me()
         info = {
@@ -669,11 +712,11 @@ async def get_account_info(session_str, index):
             "username": me.username or ""
         }
         await temp_client.disconnect()
-        account_cache[cache_key] = info
+        cache[cache_key] = info
         return info
     except:
         info = {"phone": "غير معروف", "name": "غير متصل", "connected": False, "id": None, "username": ""}
-        account_cache[cache_key] = info
+        cache[cache_key] = info
         return info
 
 # --- 🔥 Account Status Check ---
@@ -743,9 +786,10 @@ async def auto_leave_channels():
             await asyncio.sleep(60)
 
 def ensure_auto_leave_task():
-    global auto_leave_task
-    if auto_leave_task is None or auto_leave_task.done():
-        auto_leave_task = asyncio.create_task(auto_leave_channels())
+    profile_id = current_profile_id()
+    task = profile_auto_leave_tasks.get(profile_id)
+    if task is None or task.done():
+        profile_auto_leave_tasks[profile_id] = asyncio.create_task(auto_leave_channels())
 
 # --- Join channel for all accounts ---
 async def join_channel_for_account(session_str, account_index, channel):
@@ -883,13 +927,13 @@ async def ensure_account_in_group(client, group, account_number):
 
 
 async def auto_posting_loop():
-    global db, account_cache, account_status
+    global db
     active_clients = []
     account_info = []
     try:
         for idx, session_str in enumerate(db["accounts"]):
             try:
-                client = Client(f"active_session_{idx}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
+                client = Client(f"active_session_{current_profile_id()}_{idx}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
                 await client.start()
                 me = await client.get_me()
                 active_clients.append(client)
@@ -1152,7 +1196,7 @@ async def forward_group_message_to_owner(message, source_account=None):
 
 async def start_userbot_monitor(session_str, index):
     """تشغيل عميل لكل حساب لمراقبة الروابط والرسائل في الكروبات."""
-    client = Client(f"userbot_{index}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
+    client = Client(f"userbot_{current_profile_id()}_{index}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
 
     @client.on_message(filters.group & filters.incoming)
     async def userbot_message_handler(ub_client, message):
@@ -1177,13 +1221,15 @@ async def start_userbot_monitor(session_str, index):
 
 
 async def start_all_userbots():
-    """تشغيل جميع حسابات المراقبة."""
-    global userbot_tasks
-    userbot_tasks = []
+    """تشغيل حسابات المراقبة الخاصة بملف التشغيل الحالي."""
+    profile_id = current_profile_id()
+    await stop_all_userbots(profile_id)
+    tasks = []
+    profile_userbot_tasks[profile_id] = tasks
     for idx, session_str in enumerate(db["accounts"]):
         task = asyncio.create_task(start_userbot_monitor(session_str, idx))
-        userbot_tasks.append(task)
-    print(f"🚀 Started monitoring for {len(userbot_tasks)} accounts")
+        tasks.append(task)
+    print(f"🚀 Started monitoring {len(tasks)} accounts for {profile_id}")
 
 # --- ✅ المعالج الأهم والأول: أي رسالة من بوت تحتوي روابط (يعمل إذا كان البوت الرئيسي عضواً) ---
 @app.on_message(filters.group & filters.incoming, group=0)
@@ -1237,6 +1283,7 @@ async def handle_private_messages(client: Client, message: Message):
 # --- MAIN HANDLER FOR OWNER (UNIFIED) ---
 @app.on_message(filters.private & filters.user(OWNER_ID) & filters.text, group=3)
 async def handle_owner_commands(client: Client, message: Message):
+    profile_context.set(profile_store.get("active_profile_id", "profile_1"))
     text = message.text.strip()
     user_id_str = str(OWNER_ID)
 
@@ -1266,7 +1313,7 @@ async def handle_owner_commands(client: Client, message: Message):
                     account_index = account_number - 1
                     if account_index < len(db["accounts"]):
                         session_str = db["accounts"][account_index]
-                        user_client = Client(f"reply_client_{account_index}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
+                        user_client = Client(f"reply_client_{current_profile_id()}_{account_index}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
                         await user_client.start()
                         await user_client.send_message(chat_id, reply_text, reply_to_message_id=message_id)
                         await user_client.stop()
@@ -1324,7 +1371,7 @@ async def handle_owner_commands(client: Client, message: Message):
                 )
             for session_str in db["accounts"]:
                 try:
-                    check_client = Client(f"check_session_{OWNER_ID}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
+                    check_client = Client(f"check_session_{current_profile_id()}_{OWNER_ID}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
                     await check_client.connect()
                     me = await check_client.get_me()
                     if me.phone_number == phone:
@@ -1447,13 +1494,13 @@ async def handle_owner_commands(client: Client, message: Message):
         elif state == "WAITING_RECOVER":
             session_str = text.strip()
             try:
-                temp_client = Client(f"recover_session_{OWNER_ID}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
+                temp_client = Client(f"recover_session_{current_profile_id()}_{OWNER_ID}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
                 await temp_client.connect()
                 me = await temp_client.get_me()
                 await temp_client.disconnect()
                 for existing_session in db["accounts"]:
                     try:
-                        check_client = Client(f"check_session_{OWNER_ID}", api_id=API_ID, api_hash=API_HASH, session_string=existing_session)
+                        check_client = Client(f"check_session_{current_profile_id()}_{OWNER_ID}", api_id=API_ID, api_hash=API_HASH, session_string=existing_session)
                         await check_client.connect()
                         check_me = await check_client.get_me()
                         if check_me.phone_number == me.phone_number:
@@ -1466,7 +1513,7 @@ async def handle_owner_commands(client: Client, message: Message):
                 db["accounts"].append(session_str)
                 db["user_state"].pop(user_id_str, None)
                 save_data(db)
-                globals()['account_cache'] = {}
+                get_account_cache().clear()
                 joined_count, total_groups = await join_account_to_configured_groups(
                     session_str, new_account_index
                 )
@@ -1536,10 +1583,6 @@ async def handle_owner_commands(client: Client, message: Message):
             return await message.reply_text(
                 f"📂 أنت داخل {selected_profile['name']} بالفعل.",
                 reply_markup=BOT_KEYBOARD
-            )
-        if db.get("is_running"):
-            return await message.reply_text(
-                "⚠️ أوقف البوت أولًا قبل تبديل المجموعة حتى لا تختلط إعدادات التشغيل."
             )
         db["user_state"].pop(user_id_str, None)
         await activate_profile(profile_index)
@@ -1641,18 +1684,21 @@ async def handle_owner_commands(client: Client, message: Message):
             await message.reply_text("🗑 اختر الكروب لحذفه:", reply_markup=keyboard)
 
         elif action == "start":
-            global posting_task
+            profile_id = current_profile_id()
+            posting_task = profile_posting_tasks.get(profile_id)
             if db["is_running"]:
                 # بعد إعادة التشغيل قد تبقى الراية محفوظة بينما لا توجد مهمة فعلية
                 if posting_task is not None and not posting_task.done():
                     return await message.reply_text("⚠️ البوت يعمل حاليًا.")
                 db["is_running"] = False
-                save_data(db)
+                save_data()
             if not db["accounts"] or not db["templates"] or not db["groups"]:
                 return await message.reply_text("❌ يجب إضافة حساب وكليشة وكروب أولًا.")
             db["is_running"] = True
-            save_data(db)
+            save_data()
+            await start_all_userbots()
             posting_task = asyncio.create_task(auto_posting_loop())
+            profile_posting_tasks[profile_id] = posting_task
             timer_value = db.get('timer', 60)
             await message.reply_text(
                 f"🚀 تم تشغيل البوت!\n"
@@ -1667,18 +1713,20 @@ async def handle_owner_commands(client: Client, message: Message):
             )
 
         elif action == "stop":
+            profile_id = current_profile_id()
+            posting_task = profile_posting_tasks.get(profile_id)
             if not db["is_running"]:
                 return await message.reply_text("⚠️ البوت متوقف حاليًا.")
             db["is_running"] = False
-            save_data(db)
+            save_data()
             if posting_task and not posting_task.done():
                 posting_task.cancel()
                 try:
                     await posting_task
                 except asyncio.CancelledError:
                     pass
-                posting_task = None
-            await message.reply_text("🛑 تم إيقاف البوت.")
+            profile_posting_tasks[profile_id] = None
+            await message.reply_text("🛑 تم إيقاف البوت لهذه المجموعة.")
 
         elif action == "timer":
             db["user_state"][user_id_str] = "WAITING_TIMER"
@@ -1719,7 +1767,7 @@ async def handle_owner_commands(client: Client, message: Message):
             db["account_group_last_sent"] = {}
             db["group_unread_counts"] = {}
             save_data(db)
-            globals()['account_cache'] = {}
+            get_account_cache().clear()
             await message.reply_text("🗑 تم حذف جميع الحسابات والكليشات والكروبات والقنوات الإجبارية.")
 
         elif action == "incoming_replies":
@@ -1862,12 +1910,10 @@ async def handle_callback(client: Client, callback_query):
         if deleted.get("id") == profile_store.get("active_profile_id"):
             new_index = min(index, len(profiles) - 1)
             profile_store["active_profile_id"] = profiles[new_index]["id"]
-            db = ensure_profile_data(copy.deepcopy(profiles[new_index]["data"]))
-            globals()["account_cache"] = {}
-            globals()["account_status"] = {}
-            await stop_all_userbots()
-            save_data(db)
-            await start_all_userbots()
+            profile_context.set(profiles[new_index]["id"])
+            get_account_cache().clear()
+            get_account_status_cache().clear()
+            save_data()
         else:
             save_data(db)
 
@@ -1899,7 +1945,7 @@ async def handle_callback(client: Client, callback_query):
         if 0 <= index < len(db["accounts"]):
             session_str = db["accounts"].pop(index)
             try:
-                temp_client = Client(f"logout_session_{index}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
+                temp_client = Client(f"logout_session_{current_profile_id()}_{index}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
                 await temp_client.start()
                 await temp_client.log_out()
                 await temp_client.stop()
@@ -1908,7 +1954,7 @@ async def handle_callback(client: Client, callback_query):
                 await callback_query.message.reply_text(f"🗑 تم حذف الحساب رقم {index+1} (تعذر تسجيل الخروج: {e})")
             save_data(db)
             await callback_query.message.delete()
-            globals()['account_cache'] = {}
+            get_account_cache().clear()
             db["account_joined_channels"] = {}
             save_data(db)
         else:
@@ -1956,12 +2002,17 @@ if __name__ == "__main__":
     print("  🛡️ Account ban/freeze monitoring")
     
     async def startup_tasks():
-        global posting_task
-        await start_all_userbots()
-        # استئناف النشر إذا كان البوت يعمل قبل إعادة تشغيل الخدمة
-        if db.get("is_running") and db.get("accounts") and db.get("templates") and db.get("groups"):
-            posting_task = asyncio.create_task(auto_posting_loop())
-            print("🔄 Posting loop resumed after restart")
+        # تشغيل كل ملفات التشغيل بالتوازي بعد إعادة تشغيل الخدمة
+        for profile in profile_store.get("profiles", []):
+            profile_id = profile.get("id")
+            token = profile_context.set(profile_id)
+            try:
+                await start_all_userbots()
+                if db.get("is_running") and db.get("accounts") and db.get("templates") and db.get("groups"):
+                    profile_posting_tasks[profile_id] = asyncio.create_task(auto_posting_loop())
+                    print(f"🔄 Posting loop resumed for {profile_id}")
+            finally:
+                profile_context.reset(token)
 
     # تشغيل userbots واستئناف حلقة النشر قبل تشغيل البوت الرئيسي
     asyncio.get_event_loop().run_until_complete(startup_tasks())
