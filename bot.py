@@ -44,6 +44,7 @@ auto_leave_task = None
 account_status = {}
 userbot_tasks = []  # لتخزين مهام مراقبة الحسابات
 forwarded_incoming = set()  # منع تكرار تحويل نفس الرسالة للمالك
+group_message_keys = set()  # منع عدّ نفس الرسالة مرتين عند تعدد الحسابات
 
 # --- Load/Save Data ---
 def load_data():
@@ -69,6 +70,9 @@ def load_data():
             "template_index": 0,
             "incoming_messages": {},
             "account_blocked_groups": {},
+            "account_group_posts": {},
+            "account_group_incoming": {},
+            "group_unread_counts": {},
             "auto_join_groups": True
         }
         os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
@@ -103,6 +107,9 @@ db.setdefault("last_sent_group_index", -1)
 db.setdefault("template_index", 0)
 db.setdefault("incoming_messages", {})
 db.setdefault("account_blocked_groups", {})
+db.setdefault("account_group_posts", {})
+db.setdefault("account_group_incoming", {})
+db.setdefault("group_unread_counts", {})
 db.setdefault("auto_join_groups", True)
 db.setdefault("incoming_activity", {})
 db.setdefault("group_chat_ids", {})
@@ -219,6 +226,7 @@ def clean_group_link(link):
     return link
 
 GROUP_RETRY_MINUTES = 15
+UNREAD_MESSAGES_THRESHOLD = 10
 
 
 def get_account_group_blocks(account_number):
@@ -235,6 +243,9 @@ def get_account_group_blocks(account_number):
 
 def parse_activity_time(value):
     """تحويل وقت التفاعل إلى قيمة قابلة للمقارنة مع دعم البيانات القديمة."""
+    if isinstance(value, datetime):
+        parsed = value
+        return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
     if not value or isinstance(value, (int, float)):
         return None
     try:
@@ -246,8 +257,71 @@ def parse_activity_time(value):
         return None
 
 
-def get_next_group(account_number=None):
-    """اختيار الكروب صاحب أحدث تفاعل وارد مع احترام تجميد الحساب."""
+def get_account_group_post_state(account_number, group):
+    account_key = str(account_number)
+    posts = db.get("account_group_posts", {}).get(account_key, {})
+    incoming = db.get("account_group_incoming", {}).get(account_key, {})
+    return int(posts.get(group, 0) or 0), int(incoming.get(group, 0) or 0)
+
+
+def can_account_post_to_group(account_number, group):
+    """بعد أول نشر للحساب، لا يعاد استخدام الكروب قبل 10 رسائل جديدة."""
+    post_count, incoming_count = get_account_group_post_state(account_number, group)
+    return post_count == 0 or incoming_count >= UNREAD_MESSAGES_THRESHOLD
+
+
+def mark_account_group_sent(account_number, group):
+    account_key = str(account_number)
+    db.setdefault("account_group_posts", {}).setdefault(account_key, {})
+    db.setdefault("account_group_incoming", {}).setdefault(account_key, {})
+    posts = db["account_group_posts"][account_key]
+    incoming = db["account_group_incoming"][account_key]
+    posts[group] = int(posts.get(group, 0) or 0) + 1
+    incoming[group] = 0
+
+
+async def get_group_dialog_states(client):
+    """قراءة آخر رسالة وعدد الرسائل غير المقروءة من جلسة الحساب الحالية."""
+    states = {}
+    try:
+        known_chat_ids = db.setdefault("group_chat_ids", {})
+        for configured_group in db.get("groups", []):
+            clean_group = clean_group_link(configured_group)
+            if clean_group in known_chat_ids:
+                continue
+            try:
+                chat_info = await client.get_chat(clean_group)
+                known_chat_ids[clean_group] = str(chat_info.id)
+            except Exception:
+                continue
+
+        async for dialog in client.get_dialogs():
+            group = get_configured_group_for_chat(getattr(dialog, "chat", None))
+            if not group:
+                continue
+
+            unread_count = int(getattr(dialog, "unread_messages_count", 0) or 0)
+            top_message = getattr(dialog, "top_message", None)
+            latest_time = parse_activity_time(getattr(top_message, "date", None))
+            if latest_time is None:
+                latest_time = parse_activity_time(
+                    db.get("incoming_activity", {}).get(group)
+                )
+            if latest_time is None:
+                continue
+
+            states[group] = {
+                "unread_count": unread_count,
+                "last_message_time": latest_time,
+            }
+            db.setdefault("group_unread_counts", {})[group] = unread_count
+    except Exception as error:
+        print(f"❌ Could not read group dialogs: {error}")
+    return states
+
+
+def get_next_group(account_number=None, dialog_states=None):
+    """اختيار الكروب صاحب أحدث رسالة وبداخله 10 رسائل غير مقروءة."""
     groups = db.get("groups", [])
     if not groups:
         return None
@@ -268,7 +342,15 @@ def get_next_group(account_number=None):
             except (TypeError, ValueError):
                 expired.append(group)
 
-        activity_time = parse_activity_time(incoming_activity.get(group))
+        state = (dialog_states or {}).get(group)
+        if not state:
+            continue
+        if int(state.get("unread_count", 0) or 0) < UNREAD_MESSAGES_THRESHOLD:
+            continue
+        if not can_account_post_to_group(account_number, group):
+            continue
+
+        activity_time = parse_activity_time(state.get("last_message_time"))
         if activity_time:
             available.append((group, activity_time))
 
@@ -426,6 +508,67 @@ def ensure_auto_leave_task():
         auto_leave_task = asyncio.create_task(auto_leave_channels())
 
 # --- Join channel for all accounts ---
+async def join_channel_for_account(session_str, account_index, channel):
+    """ضم حساب واحد إلى كروب واحد مع حفظ أيدي الدردشة للاختيار الدقيق."""
+    clean_link = clean_group_link(channel)
+    if not clean_link:
+        return False
+
+    user_app = None
+    joined = False
+    try:
+        user_app = Client(
+            f"join_session_{account_index}",
+            api_id=API_ID,
+            api_hash=API_HASH,
+            session_string=session_str,
+        )
+        await user_app.start()
+        try:
+            chat_info = await user_app.get_chat(clean_link)
+            db.setdefault("group_chat_ids", {})[clean_link] = str(chat_info.id)
+        except Exception:
+            pass
+
+        try:
+            await user_app.join_chat(clean_link)
+            joined = True
+            print(f"✅ Acc {account_index + 1} joined {clean_link}")
+        except Exception as error:
+            error_text = str(error).upper()
+            if "ALREADY_PARTICIPANT" in error_text or "USER_ALREADY_PARTICIPANT" in error_text:
+                joined = True
+                print(f"✅ Acc {account_index + 1} is already in {clean_link}")
+            else:
+                print(f"❌ Acc {account_index + 1} failed to join {clean_link}: {error}")
+        try:
+            chat_info = await user_app.get_chat(clean_link)
+            db.setdefault("group_chat_ids", {})[clean_link] = str(chat_info.id)
+        except Exception:
+            pass
+    except Exception as error:
+        print(f"❌ Error opening acc {account_index + 1} for {clean_link}: {error}")
+    finally:
+        if user_app:
+            try:
+                await user_app.stop()
+            except Exception:
+                pass
+    return joined
+
+
+async def join_account_to_configured_groups(session_str, account_index):
+    """عند إضافة رقم جديد، ينضم الحساب إلى كل الكروبات المسجلة."""
+    groups = list(db.get("groups", []))
+    joined_count = 0
+    for group in groups:
+        if await join_channel_for_account(session_str, account_index, group):
+            joined_count += 1
+    if groups:
+        save_data(db)
+    return joined_count, len(groups)
+
+
 async def join_channel_for_all_accounts(channel, track_for_auto_leave=True):
     clean_link = clean_group_link(channel)
     if not clean_link:
@@ -439,39 +582,8 @@ async def join_channel_for_all_accounts(channel, track_for_auto_leave=True):
     joined_any = False
     print(f"📢 Joining {clean_link} for all accounts...")
     for idx, session_str in enumerate(db["accounts"]):
-        user_app = None
-        try:
-            user_app = Client(f"reply_session_{idx}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
-            await user_app.start()
-            try:
-                chat_info = await user_app.get_chat(clean_link)
-                db.setdefault("group_chat_ids", {})[clean_link] = str(chat_info.id)
-            except Exception:
-                pass
-            try:
-                await user_app.join_chat(clean_link)
-                joined_any = True
-                print(f"✅ Acc {idx+1} joined {clean_link}")
-            except Exception as e:
-                error_text = str(e).upper()
-                if "ALREADY_PARTICIPANT" in error_text or "USER_ALREADY_PARTICIPANT" in error_text:
-                    joined_any = True
-                    print(f"✅ Acc {idx+1} is already in {clean_link}")
-                else:
-                    print(f"❌ Acc {idx+1} failed to join {clean_link}: {e}")
-            try:
-                chat_info = await user_app.get_chat(clean_link)
-                db.setdefault("group_chat_ids", {})[clean_link] = str(chat_info.id)
-            except Exception:
-                pass
-        except Exception as e:
-            print(f"❌ Error opening acc {idx+1} for {clean_link}: {e}")
-        finally:
-            if user_app:
-                try:
-                    await user_app.stop()
-                except Exception:
-                    pass
+        if await join_channel_for_account(session_str, idx, clean_link):
+            joined_any = True
     if joined_any:
         save_data(db)
     if joined_any and track_for_auto_leave:
@@ -563,8 +675,8 @@ async def auto_posting_loop():
                 save_data(db)
                 break
 
+            # الحسابات تعمل بطابور ثابت: 1 ثم 2 ثم 3، وبعد آخر حساب تعاد الدورة.
             accounts_this_round = valid_accounts.copy()
-            random.shuffle(accounts_this_round)
 
             for acc_info in accounts_this_round:
                 if not db["is_running"]:
@@ -572,8 +684,13 @@ async def auto_posting_loop():
                 await asyncio.sleep(timer_value)
                 client = acc_info["client"]
                 acc_number = acc_info["number"]
-                group = get_next_group(acc_number)
+                dialog_states = await get_group_dialog_states(client)
+                group = get_next_group(acc_number, dialog_states)
                 if group is None:
+                    print(
+                        f"⏭️ لا يوجد كروب مؤهل للحساب {acc_number}: "
+                        f"آخر رسالة + {UNREAD_MESSAGES_THRESHOLD} غير مقروءة"
+                    )
                     continue
                 template = get_next_template()
                 if template is None:
@@ -604,6 +721,7 @@ async def auto_posting_loop():
 
                     sent_msg = await client.send_message(group, template)
                     db["stats"]["sent_count"] += 1
+                    mark_account_group_sent(acc_number, group)
                     db.setdefault("outgoing_messages", {})
                     db["outgoing_messages"].setdefault(str(sent_msg.chat.id), {})[sent_msg.id] = {
                         "from_account": acc_number,
@@ -694,15 +812,28 @@ def get_configured_group_for_chat(chat):
 
 
 def record_group_interaction(message):
-    """تسجيل آخر رسالة من مستخدم حتى يذهب الإرسال للكروب الأكثر نشاطاً."""
+    """تسجيل آخر رسالة وزيادة عداد الرسائل بعد آخر نشر لكل حساب."""
     if not message.from_user or message.from_user.is_bot:
         return
     group = get_configured_group_for_chat(message.chat)
     if not group:
         return
-    db.setdefault("incoming_activity", {})[group] = datetime.now().isoformat()
-    save_data(db)
-    print(f"🔥 Latest group interaction: {group}")
+
+    message_key = (str(message.chat.id), message.id)
+    if message_key not in group_message_keys:
+        group_message_keys.add(message_key)
+        if len(group_message_keys) > 10000:
+            group_message_keys.clear()
+        db.setdefault("incoming_activity", {})[group] = datetime.now().isoformat()
+        for account_key, posts_by_group in db.get("account_group_posts", {}).items():
+            if int(posts_by_group.get(group, 0) or 0) <= 0:
+                continue
+            incoming_by_group = db.setdefault(
+                "account_group_incoming", {}
+            ).setdefault(account_key, {})
+            incoming_by_group[group] = int(incoming_by_group.get(group, 0) or 0) + 1
+        save_data(db)
+        print(f"🔥 Latest group interaction: {group}")
 
 
 async def forward_group_message_to_owner(message, source_account=None):
@@ -921,6 +1052,7 @@ async def handle_owner_commands(client: Client, message: Message):
             try:
                 await temp_client.sign_in(session_info["phone"], session_info["hash"], otp)
                 session_string = await temp_client.export_session_string()
+                new_account_index = len(db["accounts"])
                 db["accounts"].append(session_string)
                 await temp_client.disconnect()
                 if os.path.exists(f"{session_name}.session"):
@@ -928,7 +1060,13 @@ async def handle_owner_commands(client: Client, message: Message):
                 del login_sessions[OWNER_ID]
                 db["user_state"].pop(user_id_str, None)
                 save_data(db)
-                return await message.reply_text("✅ تمت إضافة الحساب بنجاح!")
+                joined_count, total_groups = await join_account_to_configured_groups(
+                    session_string, new_account_index
+                )
+                return await message.reply_text(
+                    f"✅ تمت إضافة الحساب بنجاح!\n"
+                    f"📢 انضم إلى {joined_count} من {total_groups} كروب مسجل."
+                )
             except SessionPasswordNeeded:
                 db["user_state"][user_id_str] = "WAITING_PASSWORD"
                 save_data(db)
@@ -956,6 +1094,7 @@ async def handle_owner_commands(client: Client, message: Message):
             try:
                 await temp_client.check_password(password)
                 session_string = await temp_client.export_session_string()
+                new_account_index = len(db["accounts"])
                 db["accounts"].append(session_string)
                 await temp_client.disconnect()
                 if os.path.exists(f"{session_name}.session"):
@@ -963,7 +1102,13 @@ async def handle_owner_commands(client: Client, message: Message):
                 del login_sessions[OWNER_ID]
                 db["user_state"].pop(user_id_str, None)
                 save_data(db)
-                return await message.reply_text("✅ تمت إضافة الحساب بنجاح!")
+                joined_count, total_groups = await join_account_to_configured_groups(
+                    session_string, new_account_index
+                )
+                return await message.reply_text(
+                    f"✅ تمت إضافة الحساب بنجاح!\n"
+                    f"📢 انضم إلى {joined_count} من {total_groups} كروب مسجل."
+                )
             except Exception as e:
                 return await message.reply_text(f"❌ كلمة المرور غير صحيحة: `{e}`")
 
@@ -985,11 +1130,20 @@ async def handle_owner_commands(client: Client, message: Message):
                         await check_client.disconnect()
                     except:
                         continue
+                new_account_index = len(db["accounts"])
                 db["accounts"].append(session_str)
                 db["user_state"].pop(user_id_str, None)
                 save_data(db)
                 globals()['account_cache'] = {}
-                return await message.reply_text(f"✅ تم استرداد الحساب!\nالرقم: {me.phone_number}\nالاسم: {me.first_name}")
+                joined_count, total_groups = await join_account_to_configured_groups(
+                    session_str, new_account_index
+                )
+                return await message.reply_text(
+                    f"✅ تم استرداد الحساب!\n"
+                    f"الرقم: {me.phone_number}\n"
+                    f"الاسم: {me.first_name}\n"
+                    f"📢 انضم إلى {joined_count} من {total_groups} كروب مسجل."
+                )
             except Exception as e:
                 return await message.reply_text(f"❌ فشل الاسترداد: `{e}`")
 
@@ -1025,7 +1179,9 @@ async def handle_owner_commands(client: Client, message: Message):
             save_data(db)
             for group in new_groups:
                 await join_channel_for_all_accounts(group, track_for_auto_leave=False)
-            return await message.reply_text(f"✅ تمت إضافة {added_count} كروب، وتم فحص انضمام جميع الحسابات تلقائيًا!")
+            return await message.reply_text(
+                f"✅ تمت إضافة {added_count} كروب، وتم فحص انضمام جميع الحسابات تلقائيًا!"
+            )
 
         elif state == "WAITING_TIMER":
             if text.isdigit() and 1 <= int(text) <= 86400:
@@ -1122,7 +1278,8 @@ async def handle_owner_commands(client: Client, message: Message):
                 f"📊 الحسابات: {len(db['accounts'])}\n"
                 f"📢 الكروبات: {len(db['groups'])}\n"
                 f"📝 الكليشات: {len(db['templates'])}\n"
-                f"🔄 توزيع عشوائي للحسابات والجروبات\n"
+                f"🔄 طابور حسابات متكرر بالترتيب\n"
+                f"🎯 آخر كروب نشاطًا + {UNREAD_MESSAGES_THRESHOLD} رسائل غير مقروءة\n"
                 f"📡 مراقبة الحظر والتجميد مفعلة\n"
                 f"👥 نظام الردود الآلي مفعل"
             )
@@ -1175,6 +1332,9 @@ async def handle_owner_commands(client: Client, message: Message):
             db["template_index"] = 0
             db["incoming_messages"] = {}
             db["account_blocked_groups"] = {}
+            db["account_group_posts"] = {}
+            db["account_group_incoming"] = {}
+            db["group_unread_counts"] = {}
             save_data(db)
             globals()['account_cache'] = {}
             await message.reply_text("🗑 تم حذف جميع الحسابات والكليشات والكروبات والقنوات الإجبارية.")
