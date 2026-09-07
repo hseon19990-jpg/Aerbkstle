@@ -930,98 +930,95 @@ async def auto_posting_loop():
         consecutive_errors = {info["number"]: 0 for info in valid_accounts}
         max_errors = 5
 
+        async def post_to_group(acc_info, group):
+            """تشغيل إرسال مستقل لكل كروب حتى لا تمنع مجموعةٌ بقية المجموعات."""
+            if not db["is_running"]:
+                return
+            client = acc_info["client"]
+            acc_number = acc_info["number"]
+            try:
+                await asyncio.sleep(timer_value)
+                template = get_next_template()
+                if template is None:
+                    return
+
+                joined, permanent_error = await ensure_account_in_group(client, group, acc_number)
+                if not joined:
+                    db["stats"]["failed_count"] += 1
+                    advance_group_after_attempt(group)
+                    if permanent_error:
+                        block_account_from_group(acc_number, group)
+                    save_data(db)
+                    return
+
+                status = await check_account_status(client, acc_number)
+                if status["status"] == "flood":
+                    wait_time = status.get("wait", timer_value)
+                    print(f"⏳ Acc {acc_number} flood wait {wait_time}s on {group}")
+                    await asyncio.sleep(wait_time)
+                    return
+                if status["status"] != "active":
+                    consecutive_errors[acc_number] += 1
+                    if consecutive_errors[acc_number] >= max_errors:
+                        error_msg = f"🚨 الحساب {acc_number} عالق/محظور! تم إيقاف نشاطه."
+                        print(f"❌ {error_msg}")
+                        await notify_owner(error_msg)
+                    return
+
+                sent_msg = await client.send_message(get_group_chat_target(group), template)
+                db["stats"]["sent_count"] += 1
+                mark_account_group_sent(acc_number, group)
+                db.setdefault("outgoing_messages", {})
+                db["outgoing_messages"].setdefault(str(sent_msg.chat.id), {})[sent_msg.id] = {
+                    "from_account": acc_number,
+                    "time": datetime.now().isoformat(),
+                    "template": template
+                }
+                mark_group_sent(group)
+                save_data(db)
+                consecutive_errors[acc_number] = 0
+                print(f"✅ Acc {acc_number} sent message to {group}")
+            except FloodWait as e:
+                db["stats"]["failed_count"] += 1
+                save_data(db)
+                error_msg = f"⏳ Acc {acc_number} flood wait {e.x}s on {group}"
+                print(f"⚠️ {error_msg}")
+                await notify_owner(error_msg)
+                await asyncio.sleep(e.x)
+            except UserBannedInChannel:
+                db["stats"]["failed_count"] += 1
+                error_msg = f"🚫 الحساب {acc_number} ممنوع في {group}"
+                print(f"❌ {error_msg}")
+                await notify_owner(error_msg)
+                advance_group_after_attempt(group)
+                block_account_from_group(acc_number, group)
+            except Exception as e:
+                db["stats"]["failed_count"] += 1
+                error_text = str(e)
+                print(f"❌ Acc {acc_number} failed to send to {group}: {error_text}")
+                consecutive_errors[acc_number] += 1
+                advance_group_after_attempt(group)
+                if is_permanent_group_error(error_text):
+                    block_account_from_group(acc_number, group)
+                    print(f"⏭️ Account {acc_number} will skip {group}: no send permission or invalid peer")
+
         while db["is_running"]:
             if not db["accounts"] or not db["templates"] or not db["groups"]:
                 db["is_running"] = False
                 save_data(db)
                 break
 
-            # الحسابات تعمل بطابور ثابت: 1 ثم 2 ثم 3، وبعد آخر حساب تعاد الدورة.
-            accounts_this_round = valid_accounts.copy()
+            # كل كروب يحصل على مهمة مستقلة؛ الحسابات توزع بالتناوب على الكروبات.
+            groups_this_round = list(db.get("groups", []))
+            group_tasks = []
+            for group_index, group in enumerate(groups_this_round):
+                acc_info = valid_accounts[group_index % len(valid_accounts)]
+                group_tasks.append(asyncio.create_task(post_to_group(acc_info, group)))
 
-            for acc_info in accounts_this_round:
-                if not db["is_running"]:
-                    break
-                await asyncio.sleep(timer_value)
-                client = acc_info["client"]
-                acc_number = acc_info["number"]
-                try:
-                    group = get_next_group(acc_number)
-                    if group is None:
-                        print(f"⏭️ لا يوجد كروب مسجل للحساب {acc_number}")
-                        continue
-                    template = get_next_template()
-                except Exception as error:
-                    consecutive_errors[acc_number] += 1
-                    print(f"❌ Acc {acc_number} could not prepare next post: {error}")
-                    await asyncio.sleep(1)
-                    continue
-                if template is None:
-                    continue
-
-                try:
-                    joined, permanent_error = await ensure_account_in_group(client, group, acc_number)
-                    if not joined:
-                        db["stats"]["failed_count"] += 1
-                        advance_group_after_attempt(group)
-                        if permanent_error:
-                            block_account_from_group(acc_number, group)
-                        continue
-
-                    status = await check_account_status(client, acc_number)
-                    if status["status"] == "flood":
-                        wait_time = status.get("wait", timer_value)
-                        print(f"⏳ Acc {acc_number} flood wait {wait_time}s")
-                        await asyncio.sleep(wait_time)
-                        continue
-                    if status["status"] != "active":
-                        consecutive_errors[acc_number] += 1
-                        if consecutive_errors[acc_number] >= max_errors:
-                            error_msg = f"🚨 الحساب {acc_number} عالق/محظور! تم إيقاف نشاطه."
-                            print(f"❌ {error_msg}")
-                            await notify_owner(error_msg)
-                        continue
-
-                    sent_msg = await client.send_message(get_group_chat_target(group), template)
-                    db["stats"]["sent_count"] += 1
-                    mark_account_group_sent(acc_number, group)
-                    db.setdefault("outgoing_messages", {})
-                    db["outgoing_messages"].setdefault(str(sent_msg.chat.id), {})[sent_msg.id] = {
-                        "from_account": acc_number,
-                        "time": datetime.now().isoformat(),
-                        "template": template
-                    }
-                    mark_group_sent(group)
-                    save_data(db)
-                    consecutive_errors[acc_number] = 0
-                    print(f"✅ Acc {acc_number} sent message to {group}")
-
-                except FloodWait as e:
-                    db["stats"]["failed_count"] += 1
-                    save_data(db)
-                    error_msg = f"⏳ Acc {acc_number} flood wait {e.x}s on {group}"
-                    print(f"⚠️ {error_msg}")
-                    await notify_owner(error_msg)
-                    await asyncio.sleep(e.x)
-
-                except UserBannedInChannel:
-                    db["stats"]["failed_count"] += 1
-                    error_msg = f"🚫 الحساب {acc_number} ممنوع في {group}"
-                    print(f"❌ {error_msg}")
-                    await notify_owner(error_msg)
-                    advance_group_after_attempt(group)
-                    block_account_from_group(acc_number, group)
-
-                except Exception as e:
-                    db["stats"]["failed_count"] += 1
-                    error_text = str(e)
-                    print(f"❌ Acc {acc_number} failed to send to {group}: {error_text}")
-                    consecutive_errors[acc_number] += 1
-                    advance_group_after_attempt(group)
-                    if is_permanent_group_error(error_text):
-                        block_account_from_group(acc_number, group)
-                        print(f"⏭️ Account {acc_number} will skip {group}: no send permission or invalid peer")
-
+            results = await asyncio.gather(*group_tasks, return_exceptions=True)
+            for group, result in zip(groups_this_round, results):
+                if isinstance(result, Exception):
+                    print(f"❌ خطأ غير معالج في مهمة الكروب {group}: {result}")
     except Exception as e:
         error_msg = f"❌ خطأ رئيسي في حلقة النشر: {str(e)}"
         print(f"❌ {error_msg}")
