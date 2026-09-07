@@ -80,6 +80,7 @@ def default_profile_data():
         "account_blocked_groups": {},
         "account_group_posts": {},
         "account_group_incoming": {},
+        "account_group_last_sent": {},
         "group_unread_counts": {},
         "auto_join_groups": True
     }
@@ -193,6 +194,7 @@ db.setdefault("incoming_messages", {})
 db.setdefault("account_blocked_groups", {})
 db.setdefault("account_group_posts", {})
 db.setdefault("account_group_incoming", {})
+db.setdefault("account_group_last_sent", {})
 db.setdefault("group_unread_counts", {})
 db.setdefault("auto_join_groups", True)
 db.setdefault("incoming_activity", {})
@@ -471,20 +473,38 @@ def get_account_group_post_state(account_number, group):
     return int(posts.get(group, 0) or 0), int(incoming.get(group, 0) or 0)
 
 
-def can_account_post_to_group(account_number, group):
-    """بعد أول نشر للحساب، لا يعاد استخدام الكروب قبل 10 رسائل جديدة."""
+def can_account_post_to_group(account_number, group, latest_time=None):
+    """السماح بالنشر عند وجود نشاط أحدث من آخر نشر للحساب."""
     post_count, incoming_count = get_account_group_post_state(account_number, group)
-    return post_count == 0 or incoming_count >= UNREAD_MESSAGES_THRESHOLD
+    if post_count == 0 or incoming_count >= UNREAD_MESSAGES_THRESHOLD:
+        return True
+    if latest_time is None:
+        return False
+
+    account_key = str(account_number)
+    last_sent_raw = (
+        db.get("account_group_last_sent", {})
+        .get(account_key, {})
+        .get(group)
+    )
+    last_sent_time = parse_activity_time(last_sent_raw)
+    # البيانات القديمة لا تحتوي وقت آخر إرسال؛ نسمح بعملية استعادة واحدة
+    # ثم نبدأ بتتبع الوقت من الإرسال التالي.
+    if last_sent_time is None:
+        return True
+    return latest_time > last_sent_time + timedelta(seconds=2)
 
 
 def mark_account_group_sent(account_number, group):
     account_key = str(account_number)
     db.setdefault("account_group_posts", {}).setdefault(account_key, {})
     db.setdefault("account_group_incoming", {}).setdefault(account_key, {})
+    db.setdefault("account_group_last_sent", {}).setdefault(account_key, {})
     posts = db["account_group_posts"][account_key]
     incoming = db["account_group_incoming"][account_key]
     posts[group] = int(posts.get(group, 0) or 0) + 1
     incoming[group] = 0
+    db["account_group_last_sent"][account_key][group] = datetime.now().isoformat()
 
 
 async def get_group_dialog_states(client):
@@ -587,12 +607,12 @@ def get_next_group(account_number=None, dialog_states=None):
         state = (dialog_states or {}).get(group)
         if not state:
             continue
-        if not can_account_post_to_group(account_number, group):
-            continue
-
         activity_time = parse_activity_time(state.get("last_message_time"))
-        if activity_time:
-            available.append((group, activity_time))
+        if not activity_time:
+            continue
+        if not can_account_post_to_group(account_number, group, activity_time):
+            continue
+        available.append((group, activity_time))
 
     for group in expired:
         blocked.pop(group, None)
@@ -953,7 +973,7 @@ async def auto_posting_loop():
                     if group is None:
                         print(
                             f"⏭️ لا يوجد كروب نشط مؤهل للحساب {acc_number} "
-                            f"أو لم تكتمل {UNREAD_MESSAGES_THRESHOLD} رسائل تفاعل منذ آخر نشر"
+                            "أو لا يوجد نشاط أحدث من آخر إرسال"
                         )
                         continue
                     template = get_next_template()
@@ -1642,7 +1662,7 @@ async def handle_owner_commands(client: Client, message: Message):
                 f"📢 الكروبات: {len(db['groups'])}\n"
                 f"📝 الكليشات: {len(db['templates'])}\n"
                 f"🔄 طابور حسابات متكرر بالترتيب\n"
-                f"🎯 اختيار الكروب الأحدث نشاطًا، مع انتظار {UNREAD_MESSAGES_THRESHOLD} تفاعلات قبل إعادة استخدامه للحساب نفسه\n"
+                "🎯 اختيار الكروب الأحدث نشاطًا، مع منع إعادة الإرسال لنفس النشاط\n"
                 f"📡 مراقبة الحظر والتجميد مفعلة\n"
                 f"👥 نظام الردود الآلي مفعل"
             )
@@ -1697,6 +1717,7 @@ async def handle_owner_commands(client: Client, message: Message):
             db["account_blocked_groups"] = {}
             db["account_group_posts"] = {}
             db["account_group_incoming"] = {}
+            db["account_group_last_sent"] = {}
             db["group_unread_counts"] = {}
             save_data(db)
             globals()['account_cache'] = {}
