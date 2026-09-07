@@ -1318,35 +1318,63 @@ async def handle_owner_commands(client: Client, message: Message):
             )
 
         elif state == "WAITING_PHONE":
-            phone = text.strip()
+            phone = re.sub(r"[\s()-]", "", text.strip())
+            if not re.fullmatch(r"\+\d{7,15}", phone):
+                return await message.reply_text(
+                    "❌ رقم الهاتف غير صحيح.\n"
+                    "أرسله بصيغة دولية مثل:\n"
+                    "+9647800000000"
+                )
             for session_str in db["accounts"]:
                 try:
-                    temp_client = Client(f"check_session_{OWNER_ID}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
-                    await temp_client.connect()
-                    me = await temp_client.get_me()
+                    check_client = Client(f"check_session_{OWNER_ID}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
+                    await check_client.connect()
+                    me = await check_client.get_me()
                     if me.phone_number == phone:
-                        await temp_client.disconnect()
+                        await check_client.disconnect()
                         return await message.reply_text("⚠️ هذا الرقم موجود بالفعل!")
-                    await temp_client.disconnect()
-                except:
+                    await check_client.disconnect()
+                except Exception:
                     continue
+
             session_name = f"temp_session_{OWNER_ID}"
-            temp_client = Client(session_name, api_id=API_ID, api_hash=API_HASH)
-            await temp_client.connect()
+            old_login = login_sessions.pop(OWNER_ID, None)
+            if old_login:
+                try:
+                    await old_login["client"].disconnect()
+                except Exception:
+                    pass
+
+            temp_client = None
             try:
+                # جلسة مؤقتة داخل الذاكرة تمنع تعارض ملفات .session القديمة.
+                temp_client = Client(
+                    session_name,
+                    api_id=API_ID,
+                    api_hash=API_HASH,
+                    in_memory=True,
+                )
+                await temp_client.connect()
                 sent_code = await temp_client.send_code(phone)
                 login_sessions[OWNER_ID] = {
-                    "client": temp_client, "phone": phone, "hash": sent_code.phone_code_hash, "session_name": session_name
+                    "client": temp_client,
+                    "phone": phone,
+                    "hash": sent_code.phone_code_hash,
+                    "session_name": session_name,
                 }
                 db["user_state"][user_id_str] = "WAITING_OTP"
                 save_data(db)
                 return await message.reply_text("📩 أرسل رمز التحقق:")
             except Exception as e:
-                await temp_client.disconnect()
+                if temp_client:
+                    try:
+                        await temp_client.disconnect()
+                    except Exception:
+                        pass
                 if os.path.exists(f"{session_name}.session"):
                     os.remove(f"{session_name}.session")
-                return await message.reply_text(f"❌ حدث خطأ: `{e}`")
-
+                login_sessions.pop(OWNER_ID, None)
+                return await message.reply_text(f"❌ حدث خطأ أثناء إرسال الكود:\n`{e}`")
         elif state == "WAITING_OTP":
             otp = text.strip()
             session_info = login_sessions.get(OWNER_ID)
