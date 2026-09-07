@@ -10,7 +10,12 @@ from pyrogram.errors import (
     SessionPasswordNeeded, PhoneCodeInvalid, PhoneCodeExpired, 
     FloodWait, AuthKeyUnregistered, PeerIdInvalid, UserBannedInChannel
 )
-from pyrogram.raw.functions.messages import CheckChatInvite
+try:
+    from pyrogram.raw.functions.messages import CheckChatInvite
+except ImportError:
+    # بعض إصدارات Pyrogram لا تعرض هذه الدالة بنفس المسار؛
+    # لا ينبغي أن يمنع ذلك تشغيل البوت الأساسي.
+    CheckChatInvite = None
 
 # --- Settings ---
 BOT_TOKEN = (os.environ.get("BOT_TOKEN") or "").strip()
@@ -245,7 +250,9 @@ def get_group_chat_target(group):
 
 async def get_chat_from_private_invite(client, invite_link):
     """استخراج الدردشة من رابط دعوة خاص حتى عند كون الحساب عضوًا مسبقًا."""
-    match = re.fullmatch(r"https?://t\.me/\+([\w-]+)", invite_link, flags=re.IGNORECASE)
+    if CheckChatInvite is None:
+        return None
+    match = re.fullmatch(r"(?:https?://)?t\.me/\+([\w-]+)", invite_link, flags=re.IGNORECASE)
     if not match:
         return None
     try:
@@ -738,15 +745,21 @@ async def auto_posting_loop():
                 await asyncio.sleep(timer_value)
                 client = acc_info["client"]
                 acc_number = acc_info["number"]
-                dialog_states = await get_group_dialog_states(client)
-                group = get_next_group(acc_number, dialog_states)
-                if group is None:
-                    print(
-                        f"⏭️ لا يوجد كروب مؤهل للحساب {acc_number}: "
-                        f"آخر رسالة + {UNREAD_MESSAGES_THRESHOLD} غير مقروءة"
-                    )
+                try:
+                    dialog_states = await get_group_dialog_states(client)
+                    group = get_next_group(acc_number, dialog_states)
+                    if group is None:
+                        print(
+                            f"⏭️ لا يوجد كروب مؤهل للحساب {acc_number}: "
+                            f"آخر رسالة + {UNREAD_MESSAGES_THRESHOLD} غير مقروءة"
+                        )
+                        continue
+                    template = get_next_template()
+                except Exception as error:
+                    consecutive_errors[acc_number] += 1
+                    print(f"❌ Acc {acc_number} could not prepare next post: {error}")
+                    await asyncio.sleep(1)
                     continue
-                template = get_next_template()
                 if template is None:
                     continue
 
