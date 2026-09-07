@@ -502,6 +502,9 @@ async def get_group_dialog_states(client):
             except Exception:
                 continue
 
+        # بعض إصدارات Pyrogram لا تضع top_message داخل get_dialogs().
+        # نحتفظ بحالة الحوار أولًا، ثم نقرأ آخر رسالة مباشرة للكروبات
+        # التي لم تظهر لها حالة حتى لا نرفض كروبًا نشطًا بلا سبب.
         async for dialog in client.get_dialogs():
             group = get_configured_group_for_chat(getattr(dialog, "chat", None))
             if not group:
@@ -522,6 +525,38 @@ async def get_group_dialog_states(client):
                 "last_message_time": latest_time,
             }
             db.setdefault("group_unread_counts", {})[group] = unread_count
+
+        missing_groups = [
+            configured_group
+            for configured_group in db.get("groups", [])
+            if configured_group not in states
+        ]
+        for configured_group in missing_groups:
+            latest_time = None
+            try:
+                chat_target = get_group_chat_target(configured_group)
+                async for latest_message in client.get_chat_history(chat_target, limit=1):
+                    latest_time = parse_activity_time(
+                        getattr(latest_message, "date", None)
+                    )
+                    break
+            except Exception as error:
+                print(
+                    f"⚠️ تعذر قراءة آخر رسالة من {configured_group}: "
+                    f"{str(error)[:80]}"
+                )
+
+            if latest_time is None:
+                latest_time = parse_activity_time(
+                    db.get("incoming_activity", {}).get(configured_group)
+                )
+            if latest_time is not None:
+                states[configured_group] = {
+                    "unread_count": int(
+                        db.get("group_unread_counts", {}).get(configured_group, 0) or 0
+                    ),
+                    "last_message_time": latest_time,
+                }
     except Exception as error:
         print(f"❌ Could not read group dialogs: {error}")
     return states
