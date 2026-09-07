@@ -10,6 +10,7 @@ from pyrogram.errors import (
     SessionPasswordNeeded, PhoneCodeInvalid, PhoneCodeExpired, 
     FloodWait, AuthKeyUnregistered, PeerIdInvalid, UserBannedInChannel
 )
+from pyrogram.raw.functions.messages import CheckChatInvite
 
 # --- Settings ---
 BOT_TOKEN = (os.environ.get("BOT_TOKEN") or "").strip()
@@ -226,6 +227,34 @@ def clean_group_link(link):
     if not link.startswith("@"):
         link = f"@{link}"
     return link
+
+
+def get_group_chat_target(group):
+    """إرجاع معرّف الدردشة الحقيقي بدل رابط الدعوة عند توفره."""
+    clean_group = clean_group_link(group)
+    known_chat_id = db.get("group_chat_ids", {}).get(clean_group)
+    if known_chat_id is not None:
+        try:
+            return int(known_chat_id)
+        except (TypeError, ValueError):
+            pass
+    if re.fullmatch(r"-?\d+", clean_group):
+        return int(clean_group)
+    return clean_group
+
+
+async def get_chat_from_private_invite(client, invite_link):
+    """استخراج الدردشة من رابط دعوة خاص حتى عند كون الحساب عضوًا مسبقًا."""
+    match = re.fullmatch(r"https?://t\.me/\+([\w-]+)", invite_link, flags=re.IGNORECASE)
+    if not match:
+        return None
+    try:
+        invite_state = await client.invoke(CheckChatInvite(hash=match.group(1)))
+        return getattr(invite_state, "chat", None)
+    except Exception as error:
+        print(f"⚠️ Could not resolve private invite {invite_link}: {error}")
+        return None
+
 
 GROUP_RETRY_MINUTES = 15
 UNREAD_MESSAGES_THRESHOLD = 10
@@ -484,7 +513,7 @@ async def auto_leave_channels():
                     try:
                         user_app = Client(f"leave_session_{idx}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
                         await user_app.start()
-                        await user_app.leave_chat(channel)
+                        await user_app.leave_chat(get_group_chat_target(channel))
                         print(f"🚪 Acc {idx+1} left {channel}")
                     except Exception as e:
                         success = False
@@ -520,7 +549,8 @@ async def join_channel_for_account(session_str, account_index, channel):
 
     account_key = str(account_index)
     account_joined_channels = db.setdefault("account_joined_channels", {})
-    if account_joined_channels.get(account_key, {}).get(clean_link) is True:
+    already_confirmed = account_joined_channels.get(account_key, {}).get(clean_link) is True
+    if already_confirmed and clean_link in db.get("group_chat_ids", {}):
         print(f"⏭️ Acc {account_index + 1} already confirmed in {clean_link}")
         return True
 
@@ -534,16 +564,20 @@ async def join_channel_for_account(session_str, account_index, channel):
             session_string=session_str,
         )
         await user_app.start()
+        chat_info = None
         try:
             chat_info = await user_app.get_chat(clean_link)
-            db.setdefault("group_chat_ids", {})[clean_link] = str(chat_info.id)
         except Exception:
-            pass
+            chat_info = await get_chat_from_private_invite(user_app, clean_link)
+        if chat_info and getattr(chat_info, "id", None) is not None:
+            db.setdefault("group_chat_ids", {})[clean_link] = str(chat_info.id)
 
         try:
-            await user_app.join_chat(clean_link)
+            joined_chat = await user_app.join_chat(clean_link)
             joined = True
             print(f"✅ Acc {account_index + 1} joined {clean_link}")
+            if getattr(joined_chat, "id", None) is not None:
+                db.setdefault("group_chat_ids", {})[clean_link] = str(joined_chat.id)
         except Exception as error:
             error_text = str(error).upper()
             if "ALREADY_PARTICIPANT" in error_text or "USER_ALREADY_PARTICIPANT" in error_text:
@@ -553,11 +587,13 @@ async def join_channel_for_account(session_str, account_index, channel):
                 print(f"❌ Acc {account_index + 1} failed to join {clean_link}: {error}")
         if joined:
             account_joined_channels.setdefault(account_key, {})[clean_link] = True
-        try:
-            chat_info = await user_app.get_chat(clean_link)
-            db.setdefault("group_chat_ids", {})[clean_link] = str(chat_info.id)
-        except Exception:
-            pass
+        if clean_link not in db.get("group_chat_ids", {}):
+            try:
+                chat_info = await user_app.get_chat(clean_link)
+            except Exception:
+                chat_info = await get_chat_from_private_invite(user_app, clean_link)
+            if chat_info and getattr(chat_info, "id", None) is not None:
+                db.setdefault("group_chat_ids", {})[clean_link] = str(chat_info.id)
     except Exception as error:
         print(f"❌ Error opening acc {account_index + 1} for {clean_link}: {error}")
     finally:
@@ -615,8 +651,9 @@ async def join_channel_for_all_accounts(channel, track_for_auto_leave=True):
 # --- 🚀 MAIN POSTING LOOP ---
 async def ensure_account_in_group(client, group, account_number):
     """التأكد من العضوية قبل الإرسال وإرجاع ما إذا كان الخطأ دائمًا."""
+    chat_target = get_group_chat_target(group)
     try:
-        member = await client.get_chat_member(group, "me")
+        member = await client.get_chat_member(chat_target, "me")
         status = getattr(member, "status", "")
         status = getattr(status, "value", status)
         if str(status).lower() not in ("left", "kicked", "banned"):
@@ -736,7 +773,7 @@ async def auto_posting_loop():
                             await notify_owner(error_msg)
                         continue
 
-                    sent_msg = await client.send_message(group, template)
+                    sent_msg = await client.send_message(get_group_chat_target(group), template)
                     db["stats"]["sent_count"] += 1
                     mark_account_group_sent(acc_number, group)
                     db.setdefault("outgoing_messages", {})
@@ -950,7 +987,15 @@ async def handle_bot_messages_with_links(client: Client, message: Message):
     links = extract_all_links(message)
     if not links:
         return
-    print(f"🤖 Bot '{message.from_user.username}' sent a message with {len(links)} channel link(s). Joining...")
+    sender = getattr(message, "from_user", None)
+    sender_chat = getattr(message, "sender_chat", None)
+    sender_name = (
+        getattr(sender, "username", None)
+        or getattr(sender_chat, "username", None)
+        or getattr(sender_chat, "title", None)
+        or "anonymous sender"
+    )
+    print(f"🤖 Bot '{sender_name}' sent a message with {len(links)} channel link(s). Joining...")
     for link in links:
         await join_channel_for_all_accounts(link)
 
