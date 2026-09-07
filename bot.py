@@ -1,5 +1,6 @@
 import os
 import asyncio
+import copy
 import json
 import random
 import re
@@ -53,45 +54,120 @@ forwarded_incoming = set()  # منع تكرار تحويل نفس الرسالة
 group_message_keys = set()  # منع عدّ نفس الرسالة مرتين عند تعدد الحسابات
 
 # --- Load/Save Data ---
+def default_profile_data():
+    """البيانات الافتراضية لبوت واحد، بدون أي حسابات أو معلومات مستخدم."""
+    return {
+        "accounts": [],
+        "templates": [],
+        "groups": [],
+        "group_activity": {},
+        "incoming_activity": {},
+        "group_chat_ids": {},
+        "timer": 60,
+        "is_running": False,
+        "stats": {"sent_count": 0, "failed_count": 0},
+        "user_state": {},
+        "last_message": {},
+        "outgoing_messages": {},
+        "joined_channels": {},
+        "channel_join_time": {},
+        "account_joined_channels": {},
+        "account_errors": {},
+        "last_group_index": {},
+        "last_sent_group_index": -1,
+        "template_index": 0,
+        "incoming_messages": {},
+        "account_blocked_groups": {},
+        "account_group_posts": {},
+        "account_group_incoming": {},
+        "group_unread_counts": {},
+        "auto_join_groups": True
+    }
+
+
+def ensure_profile_data(data):
+    """ترحيل البيانات القديمة وإضافة أي مفاتيح جديدة دون فقدان شيء."""
+    defaults = default_profile_data()
+    for key, value in defaults.items():
+        if key not in data:
+            data[key] = copy.deepcopy(value)
+    data.setdefault("stats", {})
+    data["stats"].setdefault("sent_count", 0)
+    data["stats"].setdefault("failed_count", 0)
+    return data
+
+
+profile_store = {
+    "active_profile_id": "profile_1",
+    "profiles": []
+}
+
+
+def profile_record(profile_id, name, data):
+    return {
+        "id": profile_id,
+        "name": name,
+        "data": ensure_profile_data(copy.deepcopy(data))
+    }
+
+
 def load_data():
     if not os.path.exists(DATA_FILE):
-        default_data = {
-            "accounts": [],
-            "templates": [],
-            "groups": [],
-            "group_activity": {},
-            "incoming_activity": {},
-            "group_chat_ids": {},
-            "timer": 60,
-            "is_running": False,
-            "stats": {"sent_count": 0, "failed_count": 0},
-            "user_state": {},
-            "last_message": {},
-            "outgoing_messages": {},
-            "joined_channels": {},
-            "channel_join_time": {},
-            "account_joined_channels": {},
-            "account_errors": {},
-            "last_group_index": {},
-            "last_sent_group_index": -1,
-            "template_index": 0,
-            "incoming_messages": {},
-            "account_blocked_groups": {},
-            "account_group_posts": {},
-            "account_group_incoming": {},
-            "group_unread_counts": {},
-            "auto_join_groups": True
-        }
+        default_data = default_profile_data()
+        profile_store["profiles"] = [
+            profile_record("profile_1", "المجموعة 1", default_data)
+        ]
         os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
-        with open(DATA_FILE, "w", encoding="utf-8") as f:
-            json.dump(default_data, f, ensure_ascii=False, indent=4)
         return default_data
     with open(DATA_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+        raw_data = json.load(f)
+
+    # البيانات القديمة كانت ملفًا مسطحًا لبوت واحد. نحولها تلقائيًا
+    # إلى المجموعة الأولى حتى لا تضيع الحسابات أو الكليشات أو الكروبات.
+    if isinstance(raw_data.get("profiles"), list):
+        stored_profiles = []
+        for index, stored in enumerate(raw_data["profiles"], 1):
+            if not isinstance(stored, dict):
+                continue
+            profile_id = str(stored.get("id") or f"profile_{index}")
+            name = str(stored.get("name") or f"المجموعة {index}").strip()
+            data = stored.get("data") or {}
+            stored_profiles.append(profile_record(profile_id, name, data))
+        if stored_profiles:
+            profile_store["profiles"] = stored_profiles
+            active_id = str(raw_data.get("active_profile_id") or stored_profiles[0]["id"])
+            if not any(item["id"] == active_id for item in stored_profiles):
+                active_id = stored_profiles[0]["id"]
+            profile_store["active_profile_id"] = active_id
+            active = next(item for item in stored_profiles if item["id"] == active_id)
+            return copy.deepcopy(active["data"])
+
+    legacy_data = ensure_profile_data(raw_data)
+    profile_store["profiles"] = [
+        profile_record("profile_1", "المجموعة 1", legacy_data)
+    ]
+    profile_store["active_profile_id"] = "profile_1"
+    return legacy_data
 
 def save_data(data):
+    ensure_profile_data(data)
+    active_id = profile_store.get("active_profile_id", "profile_1")
+    active_profile = next(
+        (item for item in profile_store.get("profiles", []) if item["id"] == active_id),
+        None
+    )
+    if active_profile is None:
+        active_profile = profile_record(active_id, "المجموعة 1", data)
+        profile_store.setdefault("profiles", []).append(active_profile)
+    active_profile["data"] = data
+    payload = {
+        "schema_version": 2,
+        "active_profile_id": active_id,
+        "profiles": profile_store.get("profiles", [])
+    }
+    os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
     with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=4)
+        json.dump(payload, f, ensure_ascii=False, indent=4)
 
 db = load_data()
 db.setdefault("accounts", [])
@@ -122,11 +198,100 @@ db.setdefault("auto_join_groups", True)
 db.setdefault("incoming_activity", {})
 db.setdefault("group_chat_ids", {})
 
+# --- Bot profiles / groups ---
+def get_active_profile():
+    active_id = profile_store.get("active_profile_id")
+    return next(
+        (item for item in profile_store.get("profiles", []) if item["id"] == active_id),
+        None
+    )
+
+
+def get_profile_index_by_name(name):
+    normalized = normalize_button_text(name)
+    for index, profile in enumerate(profile_store.get("profiles", [])):
+        if normalize_button_text(profile.get("name", "")) == normalized:
+            return index
+    return None
+
+
+def next_profile_id():
+    used_ids = {str(item.get("id")) for item in profile_store.get("profiles", [])}
+    number = 1
+    while f"profile_{number}" in used_ids:
+        number += 1
+    return f"profile_{number}"
+
+
+def profile_menu_keyboard():
+    keyboard = []
+    for profile in profile_store.get("profiles", []):
+        keyboard.append([KeyboardButton(profile.get("name", "مجموعة"))])
+    keyboard.append([
+        KeyboardButton("➕ إضافة مجموعة"),
+        KeyboardButton("🗑 حذف مجموعة")
+    ])
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+
+def profile_menu_text():
+    active = get_active_profile()
+    active_name = active.get("name", "المجموعة 1") if active else "المجموعة 1"
+    lines = ["🤖 مجموعات البوت", "", f"📂 المجموعة الحالية: {active_name}", ""]
+    for index, profile in enumerate(profile_store.get("profiles", []), 1):
+        marker = "✅" if profile.get("id") == profile_store.get("active_profile_id") else "📁"
+        lines.append(f"{marker} {index}. {profile.get('name', f'المجموعة {index}')}")
+    lines.append("")
+    lines.append("اختر مجموعة لفتح إعداداتها.")
+    return "\n".join(lines)
+
+
+def empty_profile_data():
+    """إنشاء مجموعة جديدة بنفس هيكل البوت الحالية ولكن بلا معلومات."""
+    new_data = default_profile_data()
+    new_data["timer"] = int(db.get("timer", 60) or 60)
+    new_data["auto_join_groups"] = bool(db.get("auto_join_groups", True))
+    return new_data
+
+
+async def show_profile_menu(message):
+    await message.reply_text(
+        profile_menu_text(),
+        reply_markup=profile_menu_keyboard()
+    )
+
+
+async def stop_all_userbots():
+    global userbot_tasks
+    tasks = list(userbot_tasks)
+    userbot_tasks = []
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def activate_profile(index):
+    global db, account_cache, account_status
+    profiles = profile_store.get("profiles", [])
+    if not 0 <= index < len(profiles):
+        return False
+    selected = profiles[index]
+    profile_store["active_profile_id"] = selected["id"]
+    db = ensure_profile_data(copy.deepcopy(selected["data"]))
+    account_cache = {}
+    account_status = {}
+    save_data(db)
+    await stop_all_userbots()
+    await start_all_userbots()
+    return True
+
+
 # --- Bot Client ---
 app = Client("auto_post_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# --- Main Keyboard ---
-MAIN_KEYBOARD = ReplyKeyboardMarkup(
+# --- Bot settings keyboard ---
+BOT_KEYBOARD = ReplyKeyboardMarkup(
     [
         [KeyboardButton("➕ إضافة حساب"), KeyboardButton("🔄 استرداد حساب")],
         [KeyboardButton("🗑 حذف حساب"), KeyboardButton("📋 قائمة الحسابات")],
@@ -137,8 +302,8 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
         [KeyboardButton("⏱ المؤقت"), KeyboardButton("📊 الإحصائيات")],
         [KeyboardButton("🗑 حذف الكل")],
         [KeyboardButton("👥 الردود الواردة")],
-        [KeyboardButton("🔄 حالة الردود")],
-        [KeyboardButton("⚙️ إعدادات الردود")]
+        [KeyboardButton("🔄 حالة الردود"), KeyboardButton("⚙️ إعدادات الردود")],
+        [KeyboardButton("⬅️ المجموعات")]
     ],
     resize_keyboard=True
 )
@@ -160,7 +325,8 @@ MENU_ACTIONS = {
     "clear": {"🗑 حذف الكل", "حذف الكل", "🗑 Clear All"},
     "incoming_replies": {"👥 الردود الواردة", "الردود الواردة", "👥 Replies"},
     "reply_status": {"🔄 حالة الردود", "حالة الردود", "🔄 Status"},
-    "reply_settings": {"⚙️ إعدادات الردود", "إعدادات الردود", "⚙️ Settings"}
+    "reply_settings": {"⚙️ إعدادات الردود", "إعدادات الردود", "⚙️ Settings"},
+    "profiles": {"⬅️ المجموعات", "المجموعات", "⬅️ Groups Menu"}
 }
 
 def normalize_button_text(value):
@@ -1093,7 +1259,35 @@ async def handle_owner_commands(client: Client, message: Message):
 
     state = db["user_state"].get(user_id_str)
     if state:
-        if state == "WAITING_PHONE":
+        if state == "WAITING_PROFILE_NAME":
+            profile_name = text.strip()
+            reserved_names = {
+                "➕ إضافة مجموعة",
+                "🗑 حذف مجموعة",
+                "⬅️ المجموعات"
+            }
+            if not profile_name or len(profile_name) > 40:
+                return await message.reply_text("❌ أرسل اسمًا بين 1 و40 حرفًا.")
+            if profile_name in reserved_names:
+                return await message.reply_text("❌ هذا الاسم محجوز. اختر اسمًا آخر.")
+            if get_profile_index_by_name(profile_name) is not None:
+                return await message.reply_text("⚠️ توجد مجموعة بهذا الاسم بالفعل. أرسل اسمًا مختلفًا.")
+
+            new_profile = profile_record(
+                next_profile_id(),
+                profile_name,
+                empty_profile_data()
+            )
+            profile_store.setdefault("profiles", []).append(new_profile)
+            db["user_state"].pop(user_id_str, None)
+            save_data(db)
+            return await message.reply_text(
+                f"✅ تمت إضافة {profile_name}.\n"
+                "المجموعة الجديدة فارغة وجاهزة لإضافة إعداداتها.",
+                reply_markup=profile_menu_keyboard()
+            )
+
+        elif state == "WAITING_PHONE":
             phone = text.strip()
             for session_str in db["accounts"]:
                 try:
@@ -1275,9 +1469,59 @@ async def handle_owner_commands(client: Client, message: Message):
             else:
                 return await message.reply_text("❌ أرسل رقمًا صحيحًا بين 1 و86400")
 
+    if text == "⬅️ المجموعات":
+        db["user_state"].pop(user_id_str, None)
+        save_data(db)
+        return await show_profile_menu(message)
+
+    profile_index = get_profile_index_by_name(text)
+    if profile_index is not None:
+        selected_profile = profile_store["profiles"][profile_index]
+        if selected_profile["id"] == profile_store.get("active_profile_id"):
+            return await message.reply_text(
+                f"📂 أنت داخل {selected_profile['name']} بالفعل.",
+                reply_markup=BOT_KEYBOARD
+            )
+        if db.get("is_running"):
+            return await message.reply_text(
+                "⚠️ أوقف البوت أولًا قبل تبديل المجموعة حتى لا تختلط إعدادات التشغيل."
+            )
+        db["user_state"].pop(user_id_str, None)
+        await activate_profile(profile_index)
+        return await message.reply_text(
+            f"📂 تم فتح {selected_profile['name']}.\n\n"
+            f"الحسابات: {len(db['accounts'])}\n"
+            f"الكليشات: {len(db['templates'])}\n"
+            f"الكروبات: {len(db['groups'])}\n"
+            f"المؤقت: {db.get('timer', 60)} ثانية",
+            reply_markup=BOT_KEYBOARD
+        )
+
+    if text == "➕ إضافة مجموعة":
+        db["user_state"][user_id_str] = "WAITING_PROFILE_NAME"
+        save_data(db)
+        return await message.reply_text(
+            "➕ أرسل اسم المجموعة الجديدة.\n"
+            "سيتم إنشاء نسخة مستقلة من البوت بدون حسابات أو كليشات أو كروبات."
+        )
+
+    if text == "🗑 حذف مجموعة":
+        profiles = profile_store.get("profiles", [])
+        if len(profiles) <= 1:
+            return await message.reply_text("⚠️ لا يمكن حذف المجموعة الوحيدة.")
+        keyboard = create_selection_list(
+            [profile.get("name", "مجموعة") for profile in profiles],
+            "profile",
+            "delete_profile"
+        )
+        return await message.reply_text("🗑 اختر المجموعة التي تريد حذفها:", reply_markup=keyboard)
+
     action = get_menu_action(text)
     if action:
         db["user_state"].pop(user_id_str, None)
+
+        if action == "profiles":
+            return await show_profile_menu(message)
 
         if action == "accounts":
             if not db["accounts"]:
@@ -1483,6 +1727,7 @@ def create_selection_list(items, item_type, action):
 # --- Handle Callback Query ---
 @app.on_callback_query()
 async def handle_callback(client: Client, callback_query):
+    global db
     if callback_query.from_user.id != OWNER_ID:
         return await callback_query.answer("غير مصرح")
     data = callback_query.data
@@ -1540,7 +1785,42 @@ async def handle_callback(client: Client, callback_query):
         except Exception as e:
             await callback_query.message.reply_text(f"❌ تعذر عرض الرد: {e}")
         return
-    if data.startswith("delete_template_"):
+    if data.startswith("delete_profile_"):
+        try:
+            index = int(data.split("_")[2])
+        except (IndexError, ValueError):
+            return await callback_query.message.reply_text("❌ المجموعة غير موجودة.")
+
+        profiles = profile_store.get("profiles", [])
+        if len(profiles) <= 1:
+            return await callback_query.message.reply_text("⚠️ لا يمكن حذف المجموعة الوحيدة.")
+        if not 0 <= index < len(profiles):
+            return await callback_query.message.reply_text("❌ المجموعة غير موجودة.")
+        if db.get("is_running"):
+            return await callback_query.message.reply_text(
+                "⚠️ أوقف البوت أولًا قبل حذف مجموعة."
+            )
+
+        deleted = profiles.pop(index)
+        deleted_name = deleted.get("name", "المجموعة")
+        if deleted.get("id") == profile_store.get("active_profile_id"):
+            new_index = min(index, len(profiles) - 1)
+            profile_store["active_profile_id"] = profiles[new_index]["id"]
+            db = ensure_profile_data(copy.deepcopy(profiles[new_index]["data"]))
+            globals()["account_cache"] = {}
+            globals()["account_status"] = {}
+            await stop_all_userbots()
+            save_data(db)
+            await start_all_userbots()
+        else:
+            save_data(db)
+
+        await callback_query.message.delete()
+        await callback_query.message.reply_text(
+            f"🗑 تم حذف {deleted_name} نهائيًا.",
+            reply_markup=profile_menu_keyboard()
+        )
+    elif data.startswith("delete_template_"):
         index = int(data.split("_")[2])
         if 0 <= index < len(db["templates"]):
             deleted = db["templates"].pop(index)
@@ -1593,16 +1873,7 @@ async def start_cmd(client: Client, message: Message):
         ensure_auto_leave_task()
     db["user_state"].pop(str(OWNER_ID), None)
     save_data(db)
-    await message.reply_text(
-        "🤖 بوت النشر التلقائي\n\n"
-        f"📊 الحسابات: {len(db['accounts'])}\n"
-        f"📝 الكليشات: {len(db['templates'])}\n"
-        f"📢 الكروبات: {len(db['groups'])}\n"
-        f"⏱ المؤقت: {db.get('timer', 60)} ثانية\n"
-        f"📡 قنوات إجبارية: {len(db.get('joined_channels', {}))}\n"
-        f"📩 ردود واردة: {len(db.get('outgoing_messages', {}))}",
-        reply_markup=MAIN_KEYBOARD
-    )
+    await show_profile_menu(message)
 
 # --- Toggle auto join ---
 @app.on_message(filters.private & filters.user(OWNER_ID) & filters.command("toggle_auto_join"))
