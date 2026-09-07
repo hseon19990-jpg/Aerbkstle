@@ -430,6 +430,9 @@ async def get_chat_from_private_invite(client, invite_link):
 
 
 GROUP_RETRY_MINUTES = 15
+# عدد رسائل المستخدمين المطلوبة قبل إعادة استخدام الكروب للحساب نفسه.
+# لا نعتمد على unread_messages_count لأن حسابات Userbot قد تجعل الرسائل مقروءة
+# تلقائيًا رغم أن الكروب نشط.
 UNREAD_MESSAGES_THRESHOLD = 10
 
 
@@ -525,7 +528,7 @@ async def get_group_dialog_states(client):
 
 
 def get_next_group(account_number=None, dialog_states=None):
-    """اختيار الكروب صاحب أحدث رسالة وبداخله 10 رسائل غير مقروءة."""
+    """اختيار الكروب النشط صاحب أحدث رسالة."""
     groups = db.get("groups", [])
     if not groups:
         return None
@@ -548,8 +551,6 @@ def get_next_group(account_number=None, dialog_states=None):
 
         state = (dialog_states or {}).get(group)
         if not state:
-            continue
-        if int(state.get("unread_count", 0) or 0) < UNREAD_MESSAGES_THRESHOLD:
             continue
         if not can_account_post_to_group(account_number, group):
             continue
@@ -916,8 +917,8 @@ async def auto_posting_loop():
                     group = get_next_group(acc_number, dialog_states)
                     if group is None:
                         print(
-                            f"⏭️ لا يوجد كروب مؤهل للحساب {acc_number}: "
-                            f"آخر رسالة + {UNREAD_MESSAGES_THRESHOLD} غير مقروءة"
+                            f"⏭️ لا يوجد كروب نشط مؤهل للحساب {acc_number} "
+                            f"أو لم تكتمل {UNREAD_MESSAGES_THRESHOLD} رسائل تفاعل منذ آخر نشر"
                         )
                         continue
                     template = get_next_template()
@@ -1606,7 +1607,7 @@ async def handle_owner_commands(client: Client, message: Message):
                 f"📢 الكروبات: {len(db['groups'])}\n"
                 f"📝 الكليشات: {len(db['templates'])}\n"
                 f"🔄 طابور حسابات متكرر بالترتيب\n"
-                f"🎯 آخر كروب نشاطًا + {UNREAD_MESSAGES_THRESHOLD} رسائل غير مقروءة\n"
+                f"🎯 اختيار الكروب الأحدث نشاطًا، مع انتظار {UNREAD_MESSAGES_THRESHOLD} تفاعلات قبل إعادة استخدامه للحساب نفسه\n"
                 f"📡 مراقبة الحظر والتجميد مفعلة\n"
                 f"👥 نظام الردود الآلي مفعل"
             )
