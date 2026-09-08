@@ -1230,26 +1230,27 @@ async def ensure_account_in_group(client, group, account_number):
 
     account_memberships = db.setdefault("account_joined_channels", {})
     known_member = account_memberships.get(account_key, {}).get(clean_link) is True
-    known_chat_id = db.get("group_chat_ids", {}).get(clean_link)
     if known_member:
-        # لا يكفي وجود Chat ID عام؛ يجب حل رابط الدعوة داخل جلسة هذا الحساب
-        # حتى يُضاف الـ peer إلى SQLite storage الخاص به.
-        if clean_link.startswith("@"):
-            return True, False
+        # لا نعتمد على السجل فقط؛ نتحقق من العضوية فعليًا في كل محاولة إرسال.
         try:
             resolved_chat = await client.get_chat(clean_link)
             resolved_id = getattr(resolved_chat, "id", None)
             if resolved_id is not None:
-                db.setdefault("group_chat_ids", {})[clean_link] = str(resolved_id)
-                return True, False
+                member = await client.get_chat_member(resolved_id, "me")
+                status = getattr(member, "status", "")
+                status = getattr(status, "value", status)
+                if str(status).lower() not in ("left", "kicked", "banned"):
+                    mark_member(resolved_id)
+                    return True, False
         except FloodWait as error:
             remember_flood_wait(error)
             return False, False
         except Exception:
             pass
-        # لا نثق بالـ ID العام هنا؛ قد يكون Peer قديمًا من حساب آخر.
 
-    chat_target = get_group_chat_target(group)
+    # نستخدم الرابط/المعرف المهيأ داخل جلسة الحساب، وليس Chat ID عامًا قديمًا.
+
+    chat_target = clean_group
     try:
         member = await client.get_chat_member(chat_target, "me")
         status = getattr(member, "status", "")
