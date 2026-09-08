@@ -1935,7 +1935,12 @@ async def handle_owner_commands(client: Client, message: Message):
             for index, session_str in enumerate(db["accounts"]):
                 info = await get_account_info(session_str, index)
                 account_labels.append(f"{index+1}. {'✅' if info['connected'] else '❌'} 📱 {info['phone']}")
-            keyboard = create_selection_list(account_labels, "account", "delete_account")
+            keyboard = create_selection_list(
+                account_labels,
+                "account",
+                "delete_account",
+                current_profile_id(),
+            )
             await message.reply_text("🗑 اختر الحساب لحذفه نهائياً:", reply_markup=keyboard)
 
         elif action == "add_text":
@@ -2097,13 +2102,40 @@ def build_incoming_replies_keyboard():
 
 
 # --- Selection Helper ---
-def create_selection_list(items, item_type, action):
+def create_selection_list(items, item_type, action, context_id=None):
     keyboard = []
     for i, item in enumerate(items):
         display_text = f"{i+1}. {item[:30]}..." if len(item) > 30 else f"{i+1}. {item}"
-        keyboard.append([InlineKeyboardButton(display_text, callback_data=f"{action}_{i}")])
+        callback_data = f"{action}_{i}"
+        if context_id:
+            callback_data = f"{callback_data}_{context_id}"
+        keyboard.append([InlineKeyboardButton(display_text, callback_data=callback_data)])
     keyboard.append([InlineKeyboardButton("❌ إلغاء", callback_data="cancel")])
     return InlineKeyboardMarkup(keyboard)
+
+
+def remove_indexed_account_state(state, removed_index, one_based=True):
+    """حذف حالة حساب وترحيل مفاتيح الحسابات التي بعده."""
+    if not isinstance(state, dict):
+        return {}
+
+    removed_key = removed_index + (1 if one_based else 0)
+    updated = {}
+    for raw_key, value in state.items():
+        try:
+            key_number = int(raw_key)
+        except (TypeError, ValueError):
+            updated[raw_key] = value
+            continue
+
+        if key_number == removed_key:
+            continue
+        if key_number > removed_key:
+            updated[str(key_number - 1)] = value
+        else:
+            updated[str(key_number)] = value
+    return updated
+
 
 # --- Handle Callback Query ---
 @app.on_callback_query()
@@ -2218,24 +2250,123 @@ async def handle_callback(client: Client, callback_query):
         else:
             await callback_query.message.reply_text("❌ العنصر غير موجود.")
     elif data.startswith("delete_account_"):
-        index = int(data.split("_")[2])
-        if 0 <= index < len(db["accounts"]):
-            session_str = db["accounts"].pop(index)
+        parts = data.split("_")
+        try:
+            index = int(parts[2])
+        except (IndexError, ValueError):
+            return await callback_query.message.reply_text("❌ الحساب غير موجود.")
+
+        # زر الحساب يحمل profile_id حتى لا يُحذف حساب من المجموعة الخطأ
+        # إذا تغيّر الملف النشط أو وصلت callback في مهمة مختلفة.
+        profile_id = "_".join(parts[3:]) if len(parts) > 3 else current_profile_id()
+        profile = next(
+            (
+                item
+                for item in profile_store.get("profiles", [])
+                if item.get("id") == profile_id
+            ),
+            None,
+        )
+        if profile is None:
+            return await callback_query.message.reply_text("❌ المجموعة غير موجودة.")
+
+        token = profile_context.set(profile_id)
+        logout_error = None
+        had_userbot_tasks = bool(profile_userbot_tasks.get(profile_id))
+        try:
+            profile_data = ensure_profile_data(profile.get("data") or {})
+            accounts = profile_data.get("accounts", [])
+            if not 0 <= index < len(accounts):
+                return await callback_query.message.reply_text("❌ الحساب غير موجود.")
+
+            account_number = index + 1
+            session_str = accounts[index]
+
+            # إيقاف مراقبات الحسابات أولًا حتى لا تبقى جلسة الحساب المحذوف
+            # فعالة بعد إزالة الـ Session String من التخزين.
+            if had_userbot_tasks:
+                await stop_all_userbots(profile_id)
+
+            accounts.pop(index)
+            for key in (
+                "account_errors",
+                "last_group_index",
+                "account_blocked_groups",
+                "account_group_posts",
+                "account_group_incoming",
+                "account_group_last_sent",
+            ):
+                profile_data[key] = remove_indexed_account_state(
+                    profile_data.get(key, {}),
+                    index,
+                    one_based=True,
+                )
+            profile_data["account_joined_channels"] = remove_indexed_account_state(
+                profile_data.get("account_joined_channels", {}),
+                index,
+                one_based=False,
+            )
+            profile["data"] = profile_data
+            save_data(profile_data)
+
+            # لا نرسل رسالة نجاح إلا بعد التأكد من أن الحساب لم يعد محفوظًا.
+            persisted_profile = next(
+                (
+                    item
+                    for item in profile_store.get("profiles", [])
+                    if item.get("id") == profile_id
+                ),
+                None,
+            )
+            persisted_accounts = (
+                (persisted_profile or {}).get("data", {}).get("accounts", [])
+            )
+            if session_str in persisted_accounts:
+                raise RuntimeError("تعذر حفظ حذف الحساب في ملف البيانات")
+
+            get_account_cache().clear()
+            get_account_status_cache().clear()
+
+            # تسجيل الخروج من Telegram اختياري؛ فشلُه لا يعيد الحساب إلى التخزين.
+            temp_client = None
             try:
-                temp_client = Client(f"logout_session_{current_profile_id()}_{index}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
+                temp_client = Client(
+                    f"logout_session_{profile_id}_{index}",
+                    api_id=API_ID,
+                    api_hash=API_HASH,
+                    session_string=session_str,
+                )
                 await temp_client.start()
                 await temp_client.log_out()
-                await temp_client.stop()
-                await callback_query.message.reply_text(f"🗑 تم حذف الحساب رقم {index+1} وتسجيل الخروج بنجاح!")
-            except Exception as e:
-                await callback_query.message.reply_text(f"🗑 تم حذف الحساب رقم {index+1} (تعذر تسجيل الخروج: {e})")
-            save_data(db)
+            except Exception as error:
+                logout_error = error
+            finally:
+                if temp_client:
+                    try:
+                        await temp_client.stop()
+                    except Exception:
+                        pass
+
+            if had_userbot_tasks and profile_data.get("accounts"):
+                await start_all_userbots()
+
+            if logout_error:
+                await callback_query.message.reply_text(
+                    f"🗑 تم حذف الحساب رقم {account_number} من البوت.\n"
+                    f"⚠️ تعذر تسجيل الخروج من Telegram: {logout_error}"
+                )
+            else:
+                await callback_query.message.reply_text(
+                    f"🗑 تم حذف الحساب رقم {account_number} وتسجيل الخروج بنجاح!"
+                )
             await callback_query.message.delete()
-            get_account_cache().clear()
-            db["account_joined_channels"] = {}
-            save_data(db)
-        else:
-            await callback_query.message.reply_text("❌ العنصر غير موجود.")
+        except Exception as error:
+            print(f"❌ Account deletion failed for {profile_id}/{index}: {error}")
+            await callback_query.message.reply_text(
+                f"❌ لم يتم حذف الحساب: {str(error)[:180]}"
+            )
+        finally:
+            profile_context.reset(token)
 
 # --- /start command ---
 @app.on_message(group=-1)
