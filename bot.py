@@ -1128,19 +1128,20 @@ async def join_channel_for_account(session_str, account_index, channel):
 
 
 async def join_account_to_configured_groups(session_str, account_index):
-    """عند إضافة رقم جديد، ينضم الحساب إلى كل الكروبات والقنوات الإجبارية."""
+    """عند إضافة رقم جديد، ينضم الحساب أولاً إلى القنوات الإجبارية ثم الكروبات."""
     groups = list(db.get("groups", []))
+    mandatory_channels = list(db.get("joined_channels", {}).keys())
     joined_count = 0
+
+    # الأولوية للقنوات الإجبارية: لا نؤجلها إلى ما بعد الكروبات.
+    for channel in mandatory_channels:
+        await join_channel_for_account(session_str, account_index, channel)
+
     for group in groups:
         if await join_channel_for_account(session_str, account_index, group):
             joined_count += 1
 
-    # القنوات الإجبارية ليست ضمن قائمة الكروبات، لذلك يجب ضم الحساب الجديد
-    # إليها أيضًا حتى لو تم اكتشافها قبل إضافة هذا الحساب.
-    for channel in list(db.get("joined_channels", {}).keys()):
-        await join_channel_for_account(session_str, account_index, channel)
-
-    if groups or db.get("joined_channels"):
+    if groups or mandatory_channels:
         save_data(db)
     return joined_count, len(groups)
 
@@ -1496,11 +1497,9 @@ async def auto_posting_loop():
 
 # ===== ⭐ جديد: مراقبة الحسابات (Userbots) لاستقبال رسائل البوتات في الكروبات =====
 def is_bot_generated_message(message):
-    """التعرف على رسائل البوتات حتى لو أرسلها مشرف مجهول أو قناة."""
+    """اعتبار الرسالة آلية فقط إذا كان مرسلها حساب بوت فعليًا."""
     sender = getattr(message, "from_user", None)
-    if sender and getattr(sender, "is_bot", False):
-        return True
-    return bool(getattr(message, "sender_chat", None))
+    return bool(sender and getattr(sender, "is_bot", False))
 
 
 def get_message_context(chat_id, message_id):
@@ -2624,6 +2623,9 @@ if __name__ == "__main__":
             profile_id = profile.get("id")
             token = profile_context.set(profile_id)
             try:
+                # بعد إعادة تشغيل الخدمة، أعد فحص القنوات الإجبارية قبل استئناف النشر.
+                if db.get("accounts"):
+                    await join_all_accounts_to_configured_groups()
                 await start_all_userbots()
                 if db.get("is_running") and db.get("accounts") and db.get("templates") and db.get("groups"):
                     profile_posting_tasks[profile_id] = asyncio.create_task(auto_posting_loop())
