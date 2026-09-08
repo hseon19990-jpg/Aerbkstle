@@ -1055,10 +1055,8 @@ async def auto_leave_channels():
             await asyncio.sleep(60)
 
 def ensure_auto_leave_task():
-    profile_id = current_profile_id()
-    task = profile_auto_leave_tasks.get(profile_id)
-    if task is None or task.done():
-        profile_auto_leave_tasks[profile_id] = asyncio.create_task(auto_leave_channels())
+    """المغادرة التلقائية معطلة؛ القنوات تبقى للحسابات دون حد زمني."""
+    return
 
 # --- Join channel for all accounts ---
 async def join_channel_for_account(session_str, account_index, channel):
@@ -1198,7 +1196,7 @@ async def join_channel_for_all_accounts(channel, track_for_auto_leave=True):
         db["joined_channels"][clean_link] = join_time
         db["channel_join_time"][clean_link] = join_time
         save_data(db)
-        print(f"✅ Channel {clean_link} registered for auto-leave in 24 hours")
+        print(f"✅ Mandatory channel {clean_link} saved; automatic leaving is disabled")
     elif joined_any:
         print(f"✅ All accounts checked/joined posting group {clean_link}; it will remain in the list")
 
