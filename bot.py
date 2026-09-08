@@ -274,6 +274,7 @@ def profile_menu_keyboard():
         KeyboardButton("➕ إضافة مجموعة"),
         KeyboardButton("🗑 حذف مجموعة")
     ])
+    keyboard.append([KeyboardButton("📊 إحصائيات الكل")])
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 
@@ -289,6 +290,66 @@ def profile_menu_text():
         lines.append(f"{marker} {index}. {profile.get('name', f'المجموعة {index}')} — {status}")
     lines.append("")
     lines.append("اختر مجموعة لفتح إعداداتها.")
+    return "\n".join(lines)
+
+
+def all_profiles_stats_text():
+    """إنشاء ملخص إحصائيات كل المجموعات في رسالة واحدة."""
+    profiles = profile_store.get("profiles", [])
+    totals = {
+        "accounts": 0,
+        "templates": 0,
+        "groups": 0,
+        "sent": 0,
+        "failed": 0,
+        "incoming": 0,
+    }
+    lines = ["📊 إحصائيات جميع المجموعات", ""]
+
+    for index, profile in enumerate(profiles, 1):
+        data = ensure_profile_data(profile.get("data") or {})
+        stats = data.get("stats") or {}
+        incoming_messages = data.get("incoming_messages") or {}
+        incoming_count = sum(
+            len(messages)
+            for messages in incoming_messages.values()
+            if isinstance(messages, dict)
+        )
+        sent_count = int(stats.get("sent_count", 0) or 0)
+        failed_count = int(stats.get("failed_count", 0) or 0)
+        account_count = len(data.get("accounts") or [])
+        template_count = len(data.get("templates") or [])
+        group_count = len(data.get("groups") or [])
+        status = "🟢 يعمل" if data.get("is_running") else "🔴 متوقف"
+        name = profile.get("name") or f"المجموعة {index}"
+
+        lines.append(
+            f"{index}. {name} — {status}\n"
+            f"   حسابات: {account_count} | كروبات: {group_count} | "
+            f"كليشات: {template_count} | إرسال: {sent_count} | "
+            f"فشل: {failed_count} | ردود: {incoming_count}"
+        )
+
+        totals["accounts"] += account_count
+        totals["templates"] += template_count
+        totals["groups"] += group_count
+        totals["sent"] += sent_count
+        totals["failed"] += failed_count
+        totals["incoming"] += incoming_count
+
+    if not profiles:
+        return "📊 لا توجد مجموعات منفصلة."
+
+    lines.extend(
+        [
+            "",
+            "📌 الإجمالي الكلي",
+            f"الحسابات: {totals['accounts']} | الكروبات: {totals['groups']} | "
+            f"الكليشات: {totals['templates']}",
+            f"تم الإرسال: {totals['sent']} | فشل الإرسال: {totals['failed']} | "
+            f"الردود الواردة: {totals['incoming']}",
+        ]
+    )
     return "\n".join(lines)
 
 
@@ -1637,6 +1698,11 @@ async def handle_owner_commands(client: Client, message: Message):
         db["user_state"].pop(user_id_str, None)
         save_data(db)
         return await show_profile_menu(message)
+
+    if text == "📊 إحصائيات الكل":
+        db["user_state"].pop(user_id_str, None)
+        save_data(db)
+        return await message.reply_text(all_profiles_stats_text())
 
     profile_index = get_profile_index_by_name(text)
     if profile_index is not None:
