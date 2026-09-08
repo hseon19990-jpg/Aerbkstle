@@ -1052,17 +1052,22 @@ async def auto_posting_loop():
                 save_data(db)
                 break
 
-            # كل كروب يحصل على مهمة مستقلة؛ الحسابات توزع بالتناوب على الكروبات.
+            # كل كروب يحصل على مهمة مستقلة، والحسابات تتناوب بين الجولات.
+            # مثال: حساب 1 ثم حساب 2 ثم حساب 1 عند وجود كروب واحد.
             groups_this_round = list(db.get("groups", []))
             group_tasks = []
+            rotation_index = int(db.get("account_rotation_index", 0) or 0) % len(valid_accounts)
             for group_index, group in enumerate(groups_this_round):
-                acc_info = valid_accounts[group_index % len(valid_accounts)]
+                acc_info = valid_accounts[(group_index + rotation_index) % len(valid_accounts)]
                 group_tasks.append(asyncio.create_task(post_to_group(acc_info, group)))
 
             results = await asyncio.gather(*group_tasks, return_exceptions=True)
             for group, result in zip(groups_this_round, results):
                 if isinstance(result, Exception):
                     print(f"❌ خطأ غير معالج في مهمة الكروب {group}: {result}")
+
+            db["account_rotation_index"] = (rotation_index + 1) % len(valid_accounts)
+            save_data(db)
     except Exception as e:
         error_msg = f"❌ خطأ رئيسي في حلقة النشر: {str(e)}"
         print(f"❌ {error_msg}")
