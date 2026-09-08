@@ -519,6 +519,33 @@ def get_group_chat_target(group):
     return clean_group
 
 
+async def get_account_group_target(client, group):
+    """حل هدف الكروب داخل جلسة الحساب الحالية بدل استخدام أيدي عام."""
+    clean_group = clean_group_link(group)
+    if not clean_group:
+        return clean_group
+
+    # روابط الكروبات العامة يمكن إرسالها باسم المستخدم مباشرةً.
+    # هذا يمنع استخدام Chat ID محفوظ من جلسة حساب أخرى.
+    if clean_group.startswith("@"):
+        return clean_group
+
+    # رابط الدعوة الخاص يحتاج أن يُحل داخل جلسة الحساب الحالية.
+    if re.fullmatch(r"(?:https?://)?t\.me/\+[\w-]+", clean_group, flags=re.IGNORECASE):
+        chat_info = await get_chat_from_private_invite(client, clean_group)
+        if chat_info and getattr(chat_info, "id", None) is not None:
+            return int(chat_info.id)
+        try:
+            chat_info = await client.get_chat(clean_group)
+            if getattr(chat_info, "id", None) is not None:
+                return int(chat_info.id)
+        except Exception:
+            pass
+
+    # للأيدي الصريحة نستخدم القيمة القديمة كحل أخير.
+    return get_group_chat_target(group)
+
+
 async def get_chat_from_private_invite(client, invite_link):
     """استخراج الدردشة من رابط دعوة خاص حتى عند كون الحساب عضوًا مسبقًا."""
     if CheckChatInvite is None:
@@ -1127,7 +1154,8 @@ async def auto_posting_loop():
                         await notify_owner(error_msg)
                     return
 
-                sent_msg = await client.send_message(get_group_chat_target(group), template)
+                send_target = await get_account_group_target(client, group)
+                sent_msg = await client.send_message(send_target, template)
                 db["stats"]["sent_count"] += 1
                 mark_account_group_sent(acc_number, group)
                 db.setdefault("outgoing_messages", {})
