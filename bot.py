@@ -530,32 +530,52 @@ def is_private_invite_link(value):
 
 
 async def get_account_group_target(client, group):
-    """حل هدف الكروب داخل جلسة الحساب الحالية بدل استخدام أيدي عام."""
+    """حل هدف الدردشة داخل جلسة الحساب الحالية فقط.
+
+    لا نستخدم group_chat_ids كحل أخير؛ فهو مخزن مشترك بين الحسابات وقد
+    يحتوي على Peer غير موجود في SQLite الخاصة بجلسة الحساب الحالية.
+    """
     clean_group = clean_group_link(group)
     if not clean_group:
         return clean_group
 
-    # روابط الكروبات العامة يمكن إرسالها باسم المستخدم مباشرةً.
-    # هذا يمنع استخدام Chat ID محفوظ من جلسة حساب أخرى.
+    # اسم المستخدم العام يمكن لـ Pyrogram حله أثناء الإرسال.
     if clean_group.startswith("@"):
         return clean_group
 
-    # رابط الدعوة الخاص يحتاج أن يُحل داخل جلسة الحساب الحالية.
+    chat_info = None
     if is_private_invite_link(clean_group):
-        # get_chat ينفذ fetch_peers داخليًا، لذلك نفضله قبل استخدام
-        # CheckChatInvite حتى لا نعيد Chat ID غير موجود في SQLite.
         try:
             chat_info = await client.get_chat(clean_group)
-            if getattr(chat_info, "id", None) is not None:
-                return int(chat_info.id)
         except Exception:
-            pass
-        chat_info = await get_chat_from_private_invite(client, clean_group)
-        if chat_info and getattr(chat_info, "id", None) is not None:
-            return int(chat_info.id)
+            chat_info = await get_chat_from_private_invite(client, clean_group)
+    elif re.fullmatch(r"-?\d+", clean_group):
+        # يجب إدخال الـ peer في SQLite الخاصة بهذا الحساب قبل الإرسال.
+        try:
+            chat_info = await client.get_chat(int(clean_group))
+        except Exception as error:
+            db.setdefault("group_chat_ids", {}).pop(clean_group, None)
+            save_data(db)
+            raise ValueError(
+                f"PEER_ID_INVALID: peer {clean_group} is not available in this account session; "
+                "configure the group with its @username or invite link"
+            ) from error
+    else:
+        try:
+            chat_info = await client.get_chat(clean_group)
+        except Exception as error:
+            db.setdefault("group_chat_ids", {}).pop(clean_group, None)
+            save_data(db)
+            raise ValueError(f"PEER_ID_INVALID: could not resolve {clean_group}") from error
 
-    # للأيدي الصريحة نستخدم القيمة القديمة كحل أخير.
-    return get_group_chat_target(group)
+    resolved_id = getattr(chat_info, "id", None) if chat_info else None
+    if resolved_id is not None:
+        db.setdefault("group_chat_ids", {})[clean_group] = str(resolved_id)
+        return int(resolved_id)
+
+    db.setdefault("group_chat_ids", {}).pop(clean_group, None)
+    save_data(db)
+    raise ValueError(f"PEER_ID_INVALID: could not resolve configured group {clean_group}")
 
 
 async def get_chat_from_private_invite(client, invite_link):
@@ -1117,8 +1137,7 @@ async def ensure_account_in_group(client, group, account_number):
             return False, False
         except Exception:
             pass
-        if known_chat_id and not is_private_invite_link(clean_link):
-            return True, False
+        # لا نثق بالـ ID العام هنا؛ قد يكون Peer قديمًا من حساب آخر.
 
     chat_target = get_group_chat_target(group)
     try:
@@ -1164,8 +1183,23 @@ async def ensure_account_in_group(client, group, account_number):
     except Exception as error:
         error_text = str(error).upper()
         if "ALREADY_PARTICIPANT" in error_text or "USER_ALREADY_PARTICIPANT" in error_text:
-            mark_member()
-            return True, False
+            # العضوية وحدها لا تكفي: نحتاج Peer قابلًا للحل في جلسة الحساب.
+            try:
+                resolved_chat = await client.get_chat(clean_link)
+                resolved_id = getattr(resolved_chat, "id", None)
+                if resolved_id is not None:
+                    mark_member(resolved_id)
+                    return True, False
+            except Exception:
+                pass
+            account_memberships.get(account_key, {}).pop(clean_link, None)
+            db.setdefault("group_chat_ids", {}).pop(clean_link, None)
+            save_data(db)
+            print(
+                f"❌ Account {account_number} is already a member of {clean_link}, "
+                "but Telegram did not expose its peer; use an @username or invite link"
+            )
+            return False, True
         permanent = is_permanent_group_error(error_text)
         print(f"❌ Account {account_number} could not join {group}: {error}")
         return False, permanent
@@ -1451,14 +1485,18 @@ async def start_userbot_monitor(session_str, index):
 
     @client.on_message(filters.group & filters.incoming)
     async def userbot_message_handler(ub_client, message):
-        if is_bot_generated_message(message):
-            links = extract_all_links(message)
-            if links and db.get("auto_join_groups", True):
-                print(f"🤖 Userbot {index+1} found {len(links)} link(s); all accounts will join")
-                for link in links:
-                    await join_channel_for_all_accounts(link)
-            return
-        await forward_group_message_to_owner(message, index + 1)
+        try:
+            if is_bot_generated_message(message):
+                links = extract_all_links(message)
+                if links and db.get("auto_join_groups", True):
+                    print(f"🤖 Userbot {index+1} found {len(links)} link(s); all accounts will join")
+                    for link in links:
+                        await join_channel_for_all_accounts(link)
+                return
+            await forward_group_message_to_owner(message, index + 1)
+        except Exception as error:
+            # لا نسمح لرسالة ذات Peer قديم بإسقاط معالج التحديثات بالكامل.
+            print(f"⚠️ Userbot {index+1} skipped an update: {error}")
 
     try:
         await client.start()
@@ -1500,12 +1538,18 @@ async def handle_bot_messages_with_links(client: Client, message: Message):
     )
     print(f"🤖 Bot '{sender_name}' sent a message with {len(links)} channel link(s). Joining...")
     for link in links:
-        await join_channel_for_all_accounts(link)
+        try:
+            await join_channel_for_all_accounts(link)
+        except Exception as error:
+            print(f"⚠️ Main bot skipped auto-join update: {error}")
 
 # --- Handle incoming group messages and replies ---
 @app.on_message(filters.group & filters.incoming, group=1)
 async def handle_user_replies(client: Client, message: Message):
-    await forward_group_message_to_owner(message)
+    try:
+        await forward_group_message_to_owner(message)
+    except Exception as error:
+        print(f"⚠️ Main bot skipped group update: {error}")
 
 # --- Handle private messages from users (non-owner) ---
 @app.on_message(filters.private & filters.incoming & ~filters.user(OWNER_ID), group=2)
