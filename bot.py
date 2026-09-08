@@ -831,6 +831,66 @@ async def get_account_info(session_str, index):
         cache[cache_key] = info
         return info
 
+
+def normalize_phone_number(phone):
+    return re.sub(r"\D+", "", str(phone or ""))
+
+
+def find_account_owner_by_session(session_str):
+    """العثور على المجموعة التي تحتوي Session String نفسه."""
+    normalized_session = str(session_str or "").strip()
+    if not normalized_session:
+        return None
+    for profile in profile_store.get("profiles", []):
+        accounts = (profile.get("data") or {}).get("accounts", [])
+        for index, existing_session in enumerate(accounts):
+            if str(existing_session or "").strip() == normalized_session:
+                return {
+                    "profile_name": profile.get("name") or "مجموعة بدون اسم",
+                    "profile_id": profile.get("id"),
+                    "account_number": index + 1,
+                }
+    return None
+
+
+async def find_account_owner_by_phone(phone):
+    """البحث عن رقم الحساب في جميع المجموعات قبل إضافته."""
+    normalized_phone = normalize_phone_number(phone)
+    if not normalized_phone:
+        return None
+
+    for profile in profile_store.get("profiles", []):
+        profile_id = profile.get("id")
+        accounts = (profile.get("data") or {}).get("accounts", [])
+        token = profile_context.set(profile_id)
+        try:
+            for index, session_str in enumerate(accounts):
+                info = await get_account_info(session_str, index)
+                if (
+                    info.get("connected")
+                    and normalize_phone_number(info.get("phone")) == normalized_phone
+                ):
+                    return {
+                        "profile_name": profile.get("name") or "مجموعة بدون اسم",
+                        "profile_id": profile_id,
+                        "account_number": index + 1,
+                        "phone": info.get("phone"),
+                    }
+        finally:
+            profile_context.reset(token)
+    return None
+
+
+def duplicate_account_warning(owner, phone):
+    return (
+        "⚠️ لا يمكن إضافة هذا الحساب.\n\n"
+        f"📱 الرقم: {phone}\n"
+        f"📂 مستخدم مسبقًا في: {owner.get('profile_name', 'مجموعة غير معروفة')}\n"
+        f"🔢 رقم الحساب هناك: {owner.get('account_number', '?')}\n\n"
+        "لا يمكن استخدام نفس الرقم في أكثر من مجموعة."
+    )
+
+
 # --- 🔥 Account Status Check ---
 async def check_account_status(client, account_number):
     try:
@@ -1560,17 +1620,11 @@ async def handle_owner_commands(client: Client, message: Message):
                     "أرسله بصيغة دولية مثل:\n"
                     "+9647800000000"
                 )
-            for session_str in db["accounts"]:
-                try:
-                    check_client = Client(f"check_session_{current_profile_id()}_{OWNER_ID}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
-                    await check_client.connect()
-                    me = await check_client.get_me()
-                    if me.phone_number == phone:
-                        await check_client.disconnect()
-                        return await message.reply_text("⚠️ هذا الرقم موجود بالفعل!")
-                    await check_client.disconnect()
-                except Exception:
-                    continue
+            existing_owner = await find_account_owner_by_phone(phone)
+            if existing_owner:
+                return await message.reply_text(
+                    duplicate_account_warning(existing_owner, phone)
+                )
 
             session_name = f"temp_session_{OWNER_ID}"
             old_login = login_sessions.pop(OWNER_ID, None)
@@ -1622,6 +1676,20 @@ async def handle_owner_commands(client: Client, message: Message):
             try:
                 await temp_client.sign_in(session_info["phone"], session_info["hash"], otp)
                 session_string = await temp_client.export_session_string()
+                existing_owner = await find_account_owner_by_phone(session_info["phone"])
+                if existing_owner:
+                    await temp_client.disconnect()
+                    if os.path.exists(f"{session_name}.session"):
+                        os.remove(f"{session_name}.session")
+                    del login_sessions[OWNER_ID]
+                    db["user_state"].pop(user_id_str, None)
+                    save_data(db)
+                    return await message.reply_text(
+                        duplicate_account_warning(
+                            existing_owner,
+                            session_info["phone"],
+                        )
+                    )
                 new_account_index = len(db["accounts"])
                 db["accounts"].append(session_string)
                 await temp_client.disconnect()
@@ -1664,6 +1732,20 @@ async def handle_owner_commands(client: Client, message: Message):
             try:
                 await temp_client.check_password(password)
                 session_string = await temp_client.export_session_string()
+                existing_owner = await find_account_owner_by_phone(session_info["phone"])
+                if existing_owner:
+                    await temp_client.disconnect()
+                    if os.path.exists(f"{session_name}.session"):
+                        os.remove(f"{session_name}.session")
+                    del login_sessions[OWNER_ID]
+                    db["user_state"].pop(user_id_str, None)
+                    save_data(db)
+                    return await message.reply_text(
+                        duplicate_account_warning(
+                            existing_owner,
+                            session_info["phone"],
+                        )
+                    )
                 new_account_index = len(db["accounts"])
                 db["accounts"].append(session_string)
                 await temp_client.disconnect()
@@ -1689,17 +1771,16 @@ async def handle_owner_commands(client: Client, message: Message):
                 await temp_client.connect()
                 me = await temp_client.get_me()
                 await temp_client.disconnect()
-                for existing_session in db["accounts"]:
-                    try:
-                        check_client = Client(f"check_session_{current_profile_id()}_{OWNER_ID}", api_id=API_ID, api_hash=API_HASH, session_string=existing_session)
-                        await check_client.connect()
-                        check_me = await check_client.get_me()
-                        if check_me.phone_number == me.phone_number:
-                            await check_client.disconnect()
-                            return await message.reply_text("⚠️ هذا الحساب موجود بالفعل!")
-                        await check_client.disconnect()
-                    except:
-                        continue
+                existing_owner = find_account_owner_by_session(session_str)
+                if not existing_owner and me.phone_number:
+                    existing_owner = await find_account_owner_by_phone(me.phone_number)
+                if existing_owner:
+                    return await message.reply_text(
+                        duplicate_account_warning(
+                            existing_owner,
+                            me.phone_number or "غير معروف",
+                        )
+                    )
                 new_account_index = len(db["accounts"])
                 db["accounts"].append(session_str)
                 db["user_state"].pop(user_id_str, None)
