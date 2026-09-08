@@ -809,7 +809,7 @@ async def join_channel_for_account(session_str, account_index, channel):
     joined = False
     try:
         user_app = Client(
-            f"join_session_{account_index}",
+            f"join_session_{current_profile_id()}_{account_index}",
             api_id=API_ID,
             api_hash=API_HASH,
             session_string=session_str,
@@ -901,28 +901,85 @@ async def join_channel_for_all_accounts(channel, track_for_auto_leave=True):
 
 # --- 🚀 MAIN POSTING LOOP ---
 async def ensure_account_in_group(client, group, account_number):
-    """التأكد من العضوية قبل الإرسال وإرجاع ما إذا كان الخطأ دائمًا."""
+    """التأكد من العضوية قبل الإرسال مع احترام FLOOD_WAIT لكل حساب وكروب."""
+    clean_link = clean_group_link(group) or str(group)
+    account_key = str(account_number - 1)
+    wait_key = f"{account_key}:{clean_link}"
+    waits = db.setdefault("account_group_waits", {})
+    now_ts = datetime.now().timestamp()
+    wait_until = float(waits.get(wait_key, 0) or 0)
+    if wait_until > now_ts:
+        remaining = max(1, int(wait_until - now_ts))
+        print(f"⏳ Acc {account_number} skipping {clean_link}; Telegram wait {remaining}s remains")
+        return False, False
+    waits.pop(wait_key, None)
+
+    account_memberships = db.setdefault("account_joined_channels", {})
+    known_member = account_memberships.get(account_key, {}).get(clean_link) is True
+    known_chat_id = db.get("group_chat_ids", {}).get(clean_link)
+    if known_member and known_chat_id:
+        return True, False
+
+    def remember_flood_wait(error):
+        seconds = max(1, int(getattr(error, "x", 60) or 60))
+        waits[wait_key] = datetime.now().timestamp() + seconds
+        save_data(db)
+        print(f"⏳ Acc {account_number} must wait {seconds}s before retrying {clean_link}")
+
+    def mark_member(chat_id=None):
+        account_memberships.setdefault(account_key, {})[clean_link] = True
+        if chat_id is not None:
+            db.setdefault("group_chat_ids", {})[clean_link] = str(chat_id)
+        save_data(db)
+
     chat_target = get_group_chat_target(group)
     try:
         member = await client.get_chat_member(chat_target, "me")
         status = getattr(member, "status", "")
         status = getattr(status, "value", status)
         if str(status).lower() not in ("left", "kicked", "banned"):
+            mark_member(getattr(member, "chat", None) and getattr(member.chat, "id", None))
             return True, False
+    except FloodWait as error:
+        remember_flood_wait(error)
+        return False, False
     except Exception:
-        # قد لا يكون الكروب محفوظًا في جلسة Pyrogram؛ نجرب الانضمام مباشرة
+        pass
+
+    # عند استخدام رقم Chat ID غير معروف في جلسة الحساب، حاول حل الرابط أولًا
+    # قبل استدعاء ImportChatInvite مرة أخرى.
+    try:
+        resolved_chat = await client.get_chat(clean_link)
+        resolved_id = getattr(resolved_chat, "id", None)
+        if resolved_id is not None:
+            db.setdefault("group_chat_ids", {})[clean_link] = str(resolved_id)
+            member = await client.get_chat_member(resolved_id, "me")
+            status = getattr(member, "status", "")
+            status = getattr(status, "value", status)
+            if str(status).lower() not in ("left", "kicked", "banned"):
+                mark_member(resolved_id)
+                return True, False
+    except FloodWait as error:
+        remember_flood_wait(error)
+        return False, False
+    except Exception:
         pass
 
     try:
-        await client.join_chat(group)
+        joined_chat = await client.join_chat(group)
+        mark_member(getattr(joined_chat, "id", None))
         print(f"✅ Account {account_number} joined {group} before posting")
         return True, False
-    except Exception as e:
-        error_text = str(e).upper()
+    except FloodWait as error:
+        remember_flood_wait(error)
+        return False, False
+    except Exception as error:
+        error_text = str(error).upper()
         if "ALREADY_PARTICIPANT" in error_text or "USER_ALREADY_PARTICIPANT" in error_text:
+            mark_member()
             return True, False
         permanent = is_permanent_group_error(error_text)
-        print(f"❌ Account {account_number} could not join {group}: {e}")
+        print(f"❌ Account {account_number} could not join {group}: {error}")
         return False, permanent
 
 
