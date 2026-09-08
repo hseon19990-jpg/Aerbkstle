@@ -355,33 +355,39 @@ def all_profiles_stats_text():
 
 
 def failed_messages_text():
-    """عرض آخر محاولات الإرسال الفاشلة مع السبب والحل المقترح."""
+    """عرض آخر محاولات الإرسال مجمعة حسب الكروب ثم رقم الحساب."""
     failures = db.get("failed_messages") or []
     if not failures:
         return "✅ لا توجد رسائل فاشلة مسجلة حاليًا."
 
+    recent = failures[-10:]
+    grouped = {}
+    for item in recent:
+        group = str(item.get("group", "غير معروف"))[:100]
+        grouped.setdefault(group, []).append(item)
+
     lines = [
-        "❌ آخر الرسائل الفاشلة",
+        "❌ الرسائل الفاشلة حسب الكروبات",
         "",
-        f"إجمالي الفشل: {db.get('stats', {}).get('failed_count', 0)} | "
-        f"المعروض هنا: {min(len(failures), 10)}",
+        f"إجمالي سجل الفشل: {len(failures)} | "
+        f"المحاولات المعروضة: {len(recent)}",
         "",
     ]
-    for index, item in enumerate(reversed(failures[-10:]), 1):
-        timestamp = str(item.get("time", "غير معروف")).replace("T", " ")[:19]
-        account = item.get("account", "غير معروف")
-        group = str(item.get("group", "غير معروف"))[:100]
-        reason = str(item.get("reason", "خطأ غير مصنف"))[:260]
-        solution = str(item.get("solution", "راجع التفاصيل التقنية وأعد المحاولة."))[:320]
-        technical = str(item.get("technical", ""))[:240]
-        lines.extend([
-            f"{index}. 🕒 {timestamp} | الحساب: {account}",
-            f"📢 المجموعة: {group}",
-            f"🔎 السبب: {reason}",
-            f"🛠 الحل: {solution}",
-        ])
-        if technical and technical != reason:
-            lines.append(f"🧪 التفاصيل: {technical}")
+    for group, group_failures in grouped.items():
+        lines.append(f"📢 الكروب: {group}")
+        for item in reversed(group_failures):
+            timestamp = str(item.get("time", "غير معروف")).replace("T", " ")[:19]
+            account = item.get("account", "غير معروف")
+            reason = str(item.get("reason", "خطأ غير مصنف"))[:260]
+            solution = str(item.get("solution", "راجع التفاصيل التقنية وأعد المحاولة."))[:320]
+            technical = str(item.get("technical", ""))[:240]
+            lines.extend([
+                f"  🔢 الحساب رقم: {account} | 🕒 {timestamp}",
+                f"  🔎 السبب: {reason}",
+                f"  🛠 الحل: {solution}",
+            ])
+            if technical and technical != reason:
+                lines.append(f"  🧪 التفاصيل: {technical}")
         lines.append("")
 
     return "\n".join(lines)[:3900]
@@ -1064,9 +1070,9 @@ async def join_channel_for_account(session_str, account_index, channel):
     account_key = str(account_index)
     account_joined_channels = db.setdefault("account_joined_channels", {})
     already_confirmed = account_joined_channels.get(account_key, {}).get(clean_link) is True
-    if already_confirmed and clean_link in db.get("group_chat_ids", {}):
-        print(f"⏭️ Acc {account_index + 1} already confirmed in {clean_link}")
-        return True
+    if already_confirmed:
+        # أعد التحقق داخل جلسة الحساب؛ الـ ID العام قديم أو يخص حسابًا آخر.
+        print(f"🔄 Acc {account_index + 1} rechecking membership in {clean_link}")
 
     user_app = None
     joined = False
@@ -1098,6 +1104,7 @@ async def join_channel_for_account(session_str, account_index, channel):
                 joined = True
                 print(f"✅ Acc {account_index + 1} is already in {clean_link}")
             else:
+                record_failure(account_index + 1, clean_link, error)
                 print(f"❌ Acc {account_index + 1} failed to join {clean_link}: {error}")
         if joined:
             account_joined_channels.setdefault(account_key, {})[clean_link] = True
@@ -1109,6 +1116,7 @@ async def join_channel_for_account(session_str, account_index, channel):
             if chat_info and getattr(chat_info, "id", None) is not None:
                 db.setdefault("group_chat_ids", {})[clean_link] = str(chat_info.id)
     except Exception as error:
+        record_failure(account_index + 1, clean_link, error)
         print(f"❌ Error opening acc {account_index + 1} for {clean_link}: {error}")
     finally:
         if user_app:
@@ -1135,6 +1143,37 @@ async def join_account_to_configured_groups(session_str, account_index):
     if groups or db.get("joined_channels"):
         save_data(db)
     return joined_count, len(groups)
+
+
+async def join_all_accounts_to_configured_groups():
+    """فحص وانضمام كل الحسابات إلى كل الكروبات قبل بدء الإرسال."""
+    results = []
+    for account_index, session_str in enumerate(list(db.get("accounts", []))):
+        try:
+            joined_count, total_groups = await join_account_to_configured_groups(
+                session_str, account_index
+            )
+            results.append({
+                "account": account_index + 1,
+                "joined": joined_count,
+                "total": total_groups,
+            })
+        except Exception as error:
+            record_failure(
+                account_index + 1,
+                "كل الكروبات المسجلة",
+                error,
+                reason="تعذر فحص انضمام الحساب إلى الكروبات.",
+                solution="تحقق من Session String ومن أن الحساب يستطيع دخول الكروبات، ثم أعد التشغيل.",
+            )
+            results.append({
+                "account": account_index + 1,
+                "joined": 0,
+                "total": len(db.get("groups", [])),
+            })
+    if results:
+        save_data(db)
+    return results
 
 
 async def join_channel_for_all_accounts(channel, track_for_auto_leave=True):
@@ -2132,6 +2171,9 @@ async def handle_owner_commands(client: Client, message: Message):
                 save_data()
             if not db["accounts"] or not db["templates"] or not db["groups"]:
                 return await message.reply_text("❌ يجب إضافة حساب وكليشة وكروب أولًا.")
+
+            # لا نبدأ الإرسال قبل فحص عضوية كل حساب في كل كروب.
+            join_results = await join_all_accounts_to_configured_groups()
             db["is_running"] = True
             save_data()
             await start_all_userbots()
@@ -2144,6 +2186,12 @@ async def handle_owner_commands(client: Client, message: Message):
                 f"📊 الحسابات: {len(db['accounts'])}\n"
                 f"📢 الكروبات: {len(db['groups'])}\n"
                 f"📝 الكليشات: {len(db['templates'])}\n"
+                + "🤝 فحص انضمام الحسابات:\n"
+                + "\n".join(
+                    f"الحساب {item['account']}: {item['joined']}/{item['total']} كروب"
+                    for item in join_results
+                )
+                + "\n"
                 f"🔄 طابور حسابات متكرر بالترتيب\n"
                 "🎯 إرسال بالتناوب إلى جميع الكروبات المسجلة دون شروط نشاط\n"
                 f"📡 مراقبة الحظر والتجميد مفعلة\n"
