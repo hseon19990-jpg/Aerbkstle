@@ -519,6 +519,16 @@ def get_group_chat_target(group):
     return clean_group
 
 
+def is_private_invite_link(value):
+    return bool(
+        re.fullmatch(
+            r"(?:https?://)?t\.me/(?:\+[\w-]+|joinchat/[\w-]+)",
+            str(value or ""),
+            flags=re.IGNORECASE,
+        )
+    )
+
+
 async def get_account_group_target(client, group):
     """حل هدف الكروب داخل جلسة الحساب الحالية بدل استخدام أيدي عام."""
     clean_group = clean_group_link(group)
@@ -531,16 +541,18 @@ async def get_account_group_target(client, group):
         return clean_group
 
     # رابط الدعوة الخاص يحتاج أن يُحل داخل جلسة الحساب الحالية.
-    if re.fullmatch(r"(?:https?://)?t\.me/\+[\w-]+", clean_group, flags=re.IGNORECASE):
-        chat_info = await get_chat_from_private_invite(client, clean_group)
-        if chat_info and getattr(chat_info, "id", None) is not None:
-            return int(chat_info.id)
+    if is_private_invite_link(clean_group):
+        # get_chat ينفذ fetch_peers داخليًا، لذلك نفضله قبل استخدام
+        # CheckChatInvite حتى لا نعيد Chat ID غير موجود في SQLite.
         try:
             chat_info = await client.get_chat(clean_group)
             if getattr(chat_info, "id", None) is not None:
                 return int(chat_info.id)
         except Exception:
             pass
+        chat_info = await get_chat_from_private_invite(client, clean_group)
+        if chat_info and getattr(chat_info, "id", None) is not None:
+            return int(chat_info.id)
 
     # للأيدي الصريحة نستخدم القيمة القديمة كحل أخير.
     return get_group_chat_target(group)
@@ -550,7 +562,11 @@ async def get_chat_from_private_invite(client, invite_link):
     """استخراج الدردشة من رابط دعوة خاص حتى عند كون الحساب عضوًا مسبقًا."""
     if CheckChatInvite is None:
         return None
-    match = re.fullmatch(r"(?:https?://)?t\.me/\+([\w-]+)", invite_link, flags=re.IGNORECASE)
+    match = re.fullmatch(
+        r"(?:https?://)?t\.me/(?:\+|joinchat/)([\w-]+)",
+        invite_link,
+        flags=re.IGNORECASE,
+    )
     if not match:
         return None
     try:
@@ -1010,12 +1026,6 @@ async def ensure_account_in_group(client, group, account_number):
         return False, False
     waits.pop(wait_key, None)
 
-    account_memberships = db.setdefault("account_joined_channels", {})
-    known_member = account_memberships.get(account_key, {}).get(clean_link) is True
-    known_chat_id = db.get("group_chat_ids", {}).get(clean_link)
-    if known_member and known_chat_id:
-        return True, False
-
     def remember_flood_wait(error):
         seconds = max(1, int(getattr(error, "x", 60) or 60))
         waits[wait_key] = datetime.now().timestamp() + seconds
@@ -1027,6 +1037,28 @@ async def ensure_account_in_group(client, group, account_number):
         if chat_id is not None:
             db.setdefault("group_chat_ids", {})[clean_link] = str(chat_id)
         save_data(db)
+
+    account_memberships = db.setdefault("account_joined_channels", {})
+    known_member = account_memberships.get(account_key, {}).get(clean_link) is True
+    known_chat_id = db.get("group_chat_ids", {}).get(clean_link)
+    if known_member:
+        # لا يكفي وجود Chat ID عام؛ يجب حل رابط الدعوة داخل جلسة هذا الحساب
+        # حتى يُضاف الـ peer إلى SQLite storage الخاص به.
+        if clean_link.startswith("@"):
+            return True, False
+        try:
+            resolved_chat = await client.get_chat(clean_link)
+            resolved_id = getattr(resolved_chat, "id", None)
+            if resolved_id is not None:
+                db.setdefault("group_chat_ids", {})[clean_link] = str(resolved_id)
+                return True, False
+        except FloodWait as error:
+            remember_flood_wait(error)
+            return False, False
+        except Exception:
+            pass
+        if known_chat_id and not is_private_invite_link(clean_link):
+            return True, False
 
     chat_target = get_group_chat_target(group)
     try:
