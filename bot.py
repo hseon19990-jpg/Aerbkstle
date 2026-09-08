@@ -1583,6 +1583,28 @@ async def handle_owner_commands(client: Client, message: Message):
         return
 
     state = db["user_state"].get(user_id_str)
+    navigation_pressed = (
+        get_menu_action(text) is not None
+        or normalize_button_text(text) in {
+            normalize_button_text("📊 إحصائيات الكل"),
+            normalize_button_text("➕ إضافة مجموعة"),
+            normalize_button_text("🗑 حذف مجموعة"),
+        }
+        or get_profile_index_by_name(text) is not None
+    )
+    if state and navigation_pressed:
+        # أي زر من أزرار القائمة يلغي الإدخال الجاري، مثل انتظار رقم الهاتف
+        # أو OTP أو كلمة مرور التحقق، ثم يسمح للمعالج بتنفيذ الزر الجديد.
+        pending_login = login_sessions.pop(OWNER_ID, None)
+        if pending_login:
+            try:
+                await pending_login["client"].disconnect()
+            except Exception:
+                pass
+        db["user_state"].pop(user_id_str, None)
+        save_data(db)
+        state = None
+
     if state:
         if state == "WAITING_PROFILE_NAME":
             profile_name = text.strip()
