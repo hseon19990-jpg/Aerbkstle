@@ -555,7 +555,15 @@ async def get_chat_from_private_invite(client, invite_link):
         return None
     try:
         invite_state = await client.invoke(CheckChatInvite(hash=match.group(1)))
-        return getattr(invite_state, "chat", None)
+        chat = getattr(invite_state, "chat", None)
+        if chat is not None:
+            # CheckChatInvite يعيد معلومات الكروب فقط، لكنه لا يضيف الـ peer
+            # إلى SQLite storage. بدون ذلك يفشل send_message عند استخدام الـ ID.
+            try:
+                await client.fetch_peers([chat])
+            except Exception as error:
+                print(f"⚠️ Could not cache private invite peer {invite_link}: {error}")
+        return chat
     except Exception as error:
         print(f"⚠️ Could not resolve private invite {invite_link}: {error}")
         return None
