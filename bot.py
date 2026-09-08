@@ -68,6 +68,7 @@ def default_profile_data():
         "timer": 60,
         "is_running": False,
         "stats": {"sent_count": 0, "failed_count": 0},
+        "failed_messages": [],
         "user_state": {},
         "last_message": {},
         "outgoing_messages": {},
@@ -353,6 +354,39 @@ def all_profiles_stats_text():
     return "\n".join(lines)
 
 
+def failed_messages_text():
+    """عرض آخر محاولات الإرسال الفاشلة مع السبب والحل المقترح."""
+    failures = db.get("failed_messages") or []
+    if not failures:
+        return "✅ لا توجد رسائل فاشلة مسجلة حاليًا."
+
+    lines = [
+        "❌ آخر الرسائل الفاشلة",
+        "",
+        f"إجمالي الفشل: {db.get('stats', {}).get('failed_count', 0)} | "
+        f"المعروض هنا: {min(len(failures), 10)}",
+        "",
+    ]
+    for index, item in enumerate(reversed(failures[-10:]), 1):
+        timestamp = str(item.get("time", "غير معروف")).replace("T", " ")[:19]
+        account = item.get("account", "غير معروف")
+        group = str(item.get("group", "غير معروف"))[:100]
+        reason = str(item.get("reason", "خطأ غير مصنف"))[:260]
+        solution = str(item.get("solution", "راجع التفاصيل التقنية وأعد المحاولة."))[:320]
+        technical = str(item.get("technical", ""))[:240]
+        lines.extend([
+            f"{index}. 🕒 {timestamp} | الحساب: {account}",
+            f"📢 المجموعة: {group}",
+            f"🔎 السبب: {reason}",
+            f"🛠 الحل: {solution}",
+        ])
+        if technical and technical != reason:
+            lines.append(f"🧪 التفاصيل: {technical}")
+        lines.append("")
+
+    return "\n".join(lines)[:3900]
+
+
 def empty_profile_data():
     """إنشاء مجموعة جديدة بنفس هيكل البوت الحالية ولكن بلا معلومات."""
     new_data = default_profile_data()
@@ -405,6 +439,7 @@ BOT_KEYBOARD = ReplyKeyboardMarkup(
         [KeyboardButton("📢 إضافة كروب"), KeyboardButton("❌ حذف كروب")],
         [KeyboardButton("▶️ تشغيل البوت"), KeyboardButton("⏹ إيقاف البوت")],
         [KeyboardButton("⏱ المؤقت"), KeyboardButton("📊 الإحصائيات")],
+        [KeyboardButton("❌ الرسائل الفاشلة")],
         [KeyboardButton("🗑 حذف الكل")],
         [KeyboardButton("👥 الردود الواردة")],
         [KeyboardButton("🔄 حالة الردود"), KeyboardButton("⚙️ إعدادات الردود")],
@@ -427,6 +462,7 @@ MENU_ACTIONS = {
     "stop": {"⏹ إيقاف البوت", "إيقاف البوت", "⏹ Stop"},
     "timer": {"⏱ المؤقت", "المؤقت", "⏱ Timer"},
     "stats": {"📊 الإحصائيات", "الإحصائيات", "📊 Stats"},
+    "failed_messages": {"❌ الرسائل الفاشلة", "الرسائل الفاشلة", "❌ Failed Messages"},
     "clear": {"🗑 حذف الكل", "حذف الكل", "🗑 Clear All"},
     "incoming_replies": {"👥 الردود الواردة", "الردود الواردة", "👥 Replies"},
     "reply_status": {"🔄 حالة الردود", "حالة الردود", "🔄 Status"},
@@ -800,6 +836,41 @@ PERMANENT_GROUP_ERRORS = (
 def is_permanent_group_error(error_text):
     text = str(error_text).upper()
     return any(marker in text for marker in PERMANENT_GROUP_ERRORS)
+
+
+def failure_guidance(error_text):
+    """تحويل الخطأ التقني إلى سبب مفهوم وحل عملي."""
+    text = str(error_text or "").strip()
+    upper = text.upper()
+    rules = [
+        (("FLOODWAIT", "FLOOD_WAIT"), "Telegram طلب الانتظار بسبب كثرة الطلبات.", "انتظر المدة الظاهرة، وارفع قيمة المؤقت أو قلّل عدد الحسابات."),
+        (("USERBANNEDINCHANNEL", "USER_BANNED_IN_CHANNEL"), "الحساب ممنوع من المجموعة أو القناة.", "أزل الحظر من Telegram أو استخدم حسابًا آخر ثم أعد المحاولة."),
+        (("PEER_ID_INVALID", "ID NOT FOUND", "PEER INVALID"), "معرّف المجموعة غير متاح داخل جلسة هذا الحساب.", "أعد إضافة المجموعة باستخدام @username أو رابط دعوة، وتأكد أن الحساب عضو فيها."),
+        (("CHAT_WRITE_FORBIDDEN", "CHAT_ADMIN_REQUIRED"), "الحساب لا يملك صلاحية الكتابة في المجموعة.", "امنح الحساب صلاحية إرسال الرسائل أو اختر مجموعة تسمح بالكتابة."),
+        (("CHAT_RESTRICTED", "CHANNEL_PRIVATE", "USERNAME_INVALID"), "المجموعة خاصة أو أن الرابط/المستخدم غير صالح.", "تحقق من الرابط، واجعل الحساب عضوًا في المجموعة قبل التشغيل."),
+        (("AUTH_KEY_UNREGISTERED", "SESSION REVOKED"), "جلسة الحساب غير صالحة أو تم تسجيل خروجها.", "احذف الحساب وأعد تسجيل الدخول أو أضف Session String جديدًا."),
+        (("GROUP_JOIN_FAILED",), "تعذر الوصول إلى المجموعة أو الانضمام إليها.", "أرسل @username أو رابط الدعوة الصحيح، وتأكد من صلاحية الحساب."),
+    ]
+    for markers, reason, solution in rules:
+        if any(marker in upper for marker in markers):
+            return reason, solution
+    return "حدث خطأ غير مصنف أثناء الإرسال.", "راجع التفاصيل التقنية، ثم تحقق من عضوية الحساب وصلاحية الكتابة وأعد المحاولة."
+
+
+def record_failure(account_number, group, error_text, reason=None, solution=None):
+    """حفظ آخر أسباب الفشل لعرضها من زر الرسائل الفاشلة."""
+    raw_text = str(error_text or "").strip()
+    default_reason, default_solution = failure_guidance(raw_text)
+    failures = db.setdefault("failed_messages", [])
+    failures.append({
+        "time": datetime.now().isoformat(),
+        "account": account_number,
+        "group": str(group),
+        "reason": reason or default_reason,
+        "solution": solution or default_solution,
+        "technical": raw_text[:300],
+    })
+    del failures[:-50]
 
 
 def block_account_from_group(account_number, group):
@@ -1268,6 +1339,13 @@ async def auto_posting_loop():
                 joined, permanent_error = await ensure_account_in_group(client, group, acc_number)
                 if not joined:
                     db["stats"]["failed_count"] += 1
+                    record_failure(
+                        acc_number,
+                        group,
+                        "GROUP_JOIN_FAILED",
+                        reason="لم يتمكن الحساب من الوصول إلى المجموعة أو الانضمام إليها.",
+                        solution="أعد إضافة المجموعة باستخدام @username أو رابط دعوة صحيح، وتأكد أن الحساب عضو فيها.",
+                    )
                     advance_group_after_attempt(group)
                     if permanent_error:
                         block_account_from_group(acc_number, group)
@@ -1281,7 +1359,16 @@ async def auto_posting_loop():
                     await asyncio.sleep(wait_time)
                     return
                 if status["status"] != "active":
+                    db["stats"]["failed_count"] += 1
+                    record_failure(
+                        acc_number,
+                        group,
+                        status.get("message") or status.get("status"),
+                        reason="الحساب غير نشط أو لم يتمكن Telegram من التحقق منه.",
+                        solution="افحص جلسة الحساب، أعد تسجيل الدخول إذا لزم، ثم شغّل البوت من جديد.",
+                    )
                     consecutive_errors[acc_number] += 1
+                    save_data(db)
                     if consecutive_errors[acc_number] >= max_errors:
                         error_msg = f"🚨 الحساب {acc_number} عالق/محظور! تم إيقاف نشاطه."
                         print(f"❌ {error_msg}")
@@ -1304,6 +1391,7 @@ async def auto_posting_loop():
                 print(f"✅ Acc {acc_number} sent message to {group}")
             except FloodWait as e:
                 db["stats"]["failed_count"] += 1
+                record_failure(acc_number, group, f"FLOOD_WAIT: {e.x}s")
                 save_data(db)
                 error_msg = f"⏳ Acc {acc_number} flood wait {e.x}s on {group}"
                 print(f"⚠️ {error_msg}")
@@ -1311,6 +1399,7 @@ async def auto_posting_loop():
                 await asyncio.sleep(e.x)
             except UserBannedInChannel:
                 db["stats"]["failed_count"] += 1
+                record_failure(acc_number, group, "USER_BANNED_IN_CHANNEL")
                 error_msg = f"🚫 الحساب {acc_number} ممنوع في {group}"
                 print(f"❌ {error_msg}")
                 await notify_owner(error_msg)
@@ -1319,6 +1408,7 @@ async def auto_posting_loop():
             except Exception as e:
                 db["stats"]["failed_count"] += 1
                 error_text = str(e)
+                record_failure(acc_number, group, error_text)
                 print(f"❌ Acc {acc_number} failed to send to {group}: {error_text}")
                 consecutive_errors[acc_number] += 1
                 advance_group_after_attempt(group)
@@ -2095,12 +2185,16 @@ async def handle_owner_commands(client: Client, message: Message):
                 f"👥 ردود واردة: {len(db.get('outgoing_messages', {}))}"
             )
 
+        elif action == "failed_messages":
+            await message.reply_text(failed_messages_text())
+
         elif action == "clear":
             db["accounts"] = []
             db["templates"] = []
             db["groups"] = []
             db["group_activity"] = {}
             db["stats"] = {"sent_count": 0, "failed_count": 0}
+            db["failed_messages"] = []
             db["is_running"] = False
             db["joined_channels"] = {}
             db["channel_join_time"] = {}
