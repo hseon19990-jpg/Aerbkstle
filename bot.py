@@ -4,6 +4,7 @@ import copy
 import json
 import random
 import re
+import tempfile
 from contextvars import ContextVar
 from datetime import datetime, timedelta
 from pyrogram import Client, filters
@@ -181,16 +182,38 @@ def profile_record(profile_id, name, data):
     }
 
 
+def reset_to_default_data():
+    default_data = default_profile_data()
+    profile_store["profiles"] = [
+        profile_record("profile_1", "المجموعة 1", default_data)
+    ]
+    profile_store["active_profile_id"] = "profile_1"
+    os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
+    return default_data
+
+
 def load_data():
     if not os.path.exists(DATA_FILE):
-        default_data = default_profile_data()
-        profile_store["profiles"] = [
-            profile_record("profile_1", "المجموعة 1", default_data)
-        ]
-        os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
-        return default_data
-    with open(DATA_FILE, "r", encoding="utf-8") as f:
-        raw_data = json.load(f)
+        return reset_to_default_data()
+
+    try:
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            raw_data = json.load(f)
+    except json.JSONDecodeError as exc:
+        corrupt_path = f"{DATA_FILE}.corrupt-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        try:
+            os.replace(DATA_FILE, corrupt_path)
+        except OSError:
+            corrupt_path = "unavailable"
+        print(
+            f"Warning: invalid JSON in {DATA_FILE}: {exc}. "
+            f"Starting with default data; corrupt file: {corrupt_path}"
+        )
+        return reset_to_default_data()
+
+    if not isinstance(raw_data, dict):
+        print(f"Warning: {DATA_FILE} does not contain a JSON object. Starting with default data.")
+        return reset_to_default_data()
 
     # البيانات القديمة كانت ملفًا مسطحًا لبوت واحد. نحولها تلقائيًا
     # إلى المجموعة الأولى حتى لا تضيع الحسابات أو الكليشات أو الكروبات.
@@ -235,8 +258,23 @@ def save_data(data=None):
         "profiles": profile_store.get("profiles", [])
     }
     os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=4)
+    temp_fd, temp_path = tempfile.mkstemp(
+        prefix=".bot_data-",
+        suffix=".tmp",
+        dir=os.path.dirname(DATA_FILE)
+    )
+    try:
+        with os.fdopen(temp_fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=4)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, DATA_FILE)
+    except Exception:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+        raise
 
 load_data()
 db = ProfileDBProxy()
