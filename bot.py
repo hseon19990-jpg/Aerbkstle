@@ -267,8 +267,8 @@ def save_data(data=None):
     try:
         with os.fdopen(temp_fd, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=4)
+            # fsync بعد كل رسالة كان يجمّد حلقة asyncio ويؤخر ردود البوت.
             f.flush()
-            os.fsync(f.fileno())
         os.replace(temp_path, DATA_FILE)
     except Exception:
         try:
@@ -1401,6 +1401,8 @@ async def auto_posting_loop():
 
         consecutive_errors = {info["number"]: 0 for info in valid_accounts}
         max_errors = 5
+        # منع إرسالين متزامنين من نفس الحساب إلى مجموعتين مختلفتين.
+        account_send_locks = {info["number"]: asyncio.Lock() for info in valid_accounts}
 
         async def post_to_group(acc_info, group):
             """تشغيل إرسال مستقل لكل كروب حتى لا تمنع مجموعةٌ بقية المجموعات."""
@@ -1414,59 +1416,60 @@ async def auto_posting_loop():
                 if template is None:
                     return
 
-                joined, permanent_error = await ensure_account_in_group(client, group, acc_number)
-                if not joined:
-                    db["stats"]["failed_count"] += 1
-                    record_failure(
-                        acc_number,
-                        group,
-                        "GROUP_JOIN_FAILED",
-                        reason="لم يتمكن الحساب من الوصول إلى المجموعة أو الانضمام إليها.",
-                        solution="أعد إضافة المجموعة باستخدام @username أو رابط دعوة صحيح، وتأكد أن الحساب عضو فيها.",
-                    )
-                    advance_group_after_attempt(group)
-                    if permanent_error:
-                        block_account_from_group(acc_number, group)
-                    save_data(db)
-                    return
+                async with account_send_locks[acc_number]:
+                    joined, permanent_error = await ensure_account_in_group(client, group, acc_number)
+                    if not joined:
+                        db["stats"]["failed_count"] += 1
+                        record_failure(
+                            acc_number,
+                            group,
+                            "GROUP_JOIN_FAILED",
+                            reason="لم يتمكن الحساب من الوصول إلى المجموعة أو الانضمام إليها.",
+                            solution="أعد إضافة المجموعة باستخدام @username أو رابط دعوة صحيح، وتأكد أن الحساب عضو فيها.",
+                        )
+                        advance_group_after_attempt(group)
+                        if permanent_error:
+                            block_account_from_group(acc_number, group)
+                        save_data(db)
+                        return
 
-                status = await check_account_status(client, acc_number)
-                if status["status"] == "flood":
-                    wait_time = status.get("wait", timer_value)
-                    print(f"⏳ Acc {acc_number} flood wait {wait_time}s on {group}")
-                    await asyncio.sleep(wait_time)
-                    return
-                if status["status"] != "active":
-                    db["stats"]["failed_count"] += 1
-                    record_failure(
-                        acc_number,
-                        group,
-                        status.get("message") or status.get("status"),
-                        reason="الحساب غير نشط أو لم يتمكن Telegram من التحقق منه.",
-                        solution="افحص جلسة الحساب، أعد تسجيل الدخول إذا لزم، ثم شغّل البوت من جديد.",
-                    )
-                    consecutive_errors[acc_number] += 1
-                    save_data(db)
-                    if consecutive_errors[acc_number] >= max_errors:
-                        error_msg = f"🚨 الحساب {acc_number} عالق/محظور! تم إيقاف نشاطه."
-                        print(f"❌ {error_msg}")
-                        await notify_owner(error_msg)
-                    return
+                    status = await check_account_status(client, acc_number)
+                    if status["status"] == "flood":
+                        wait_time = status.get("wait", timer_value)
+                        print(f"⏳ Acc {acc_number} flood wait {wait_time}s on {group}")
+                        await asyncio.sleep(wait_time)
+                        return
+                    if status["status"] != "active":
+                        db["stats"]["failed_count"] += 1
+                        record_failure(
+                            acc_number,
+                            group,
+                            status.get("message") or status.get("status"),
+                            reason="الحساب غير نشط أو لم يتمكن Telegram من التحقق منه.",
+                            solution="افحص جلسة الحساب، أعد تسجيل الدخول إذا لزم، ثم شغّل البوت من جديد.",
+                        )
+                        consecutive_errors[acc_number] += 1
+                        save_data(db)
+                        if consecutive_errors[acc_number] >= max_errors:
+                            error_msg = f"🚨 الحساب {acc_number} عالق/محظور! تم إيقاف نشاطه."
+                            print(f"❌ {error_msg}")
+                            await notify_owner(error_msg)
+                        return
 
-                send_target = await get_account_group_target(client, group)
-                sent_msg = await client.send_message(send_target, template)
-                db["stats"]["sent_count"] += 1
-                mark_account_group_sent(acc_number, group)
-                db.setdefault("outgoing_messages", {})
-                db["outgoing_messages"].setdefault(str(sent_msg.chat.id), {})[sent_msg.id] = {
-                    "from_account": acc_number,
-                    "time": datetime.now().isoformat(),
-                    "template": template
-                }
-                mark_group_sent(group)
-                save_data(db)
-                consecutive_errors[acc_number] = 0
-                print(f"✅ Acc {acc_number} sent message to {group}")
+                    send_target = await get_account_group_target(client, group)
+                    sent_msg = await client.send_message(send_target, template)
+                    db["stats"]["sent_count"] += 1
+                    mark_account_group_sent(acc_number, group)
+                    db.setdefault("outgoing_messages", {})
+                    db["outgoing_messages"].setdefault(str(sent_msg.chat.id), {})[sent_msg.id] = {
+                        "from_account": acc_number,
+                        "time": datetime.now().isoformat(),
+                        "template": template
+                    }
+                    mark_group_sent(group)
+                    save_data(db)
+                    consecutive_errors[acc_number] = 0
+                    print(f"✅ Acc {acc_number} sent message to {group}")
             except FloodWait as e:
                 db["stats"]["failed_count"] += 1
                 record_failure(acc_number, group, f"FLOOD_WAIT: {e.x}s")
