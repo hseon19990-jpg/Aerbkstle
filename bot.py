@@ -1586,6 +1586,13 @@ def is_bot_generated_message(message):
     )
 
 
+def is_channel_post(message):
+    """تمييز منشورات القنوات دون اعتبارها رسائل أعضاء عادية."""
+    chat = getattr(message, "chat", None)
+    chat_type = str(getattr(chat, "type", "") or "").lower()
+    return chat_type.rsplit(".", 1)[-1] == "channel"
+
+
 def get_message_context(chat_id, message_id):
     """العثور على معلومات الرسالة المرسلة أو المحفوظة من كروب."""
     for collection in ("outgoing_messages", "incoming_messages"):
@@ -1696,17 +1703,15 @@ async def start_userbot_monitor(session_str, index):
     """تشغيل عميل لكل حساب لمراقبة الروابط والرسائل في الكروبات."""
     client = Client(f"userbot_{current_profile_id()}_{index}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
 
-    @client.on_message(filters.incoming & (filters.group | filters.channel))
+    # لا نراقب رسائل الأعضاء العادية: بوتات داخل الكروبات أو منشورات القنوات فقط.
+    @client.on_message(filters.incoming & (filters.bot | filters.channel))
     async def userbot_message_handler(ub_client, message):
         try:
-            if is_bot_generated_message(message):
-                links = extract_all_links(message)
-                if links and db.get("auto_join_groups", True):
-                    print(f"🤖 Userbot {index+1} found {len(links)} link(s); all accounts will join")
-                    for link in links:
-                        await join_channel_for_all_accounts(link)
-                return
-            await forward_group_message_to_owner(message, index + 1)
+            links = extract_all_links(message)
+            if links and db.get("auto_join_groups", True):
+                print(f"🤖 Userbot {index+1} found {len(links)} link(s); all accounts will join")
+                for link in links:
+                    await join_channel_for_all_accounts(link)
         except Exception as error:
             # لا نسمح لرسالة ذات Peer قديم بإسقاط معالج التحديثات بالكامل.
             print(f"⚠️ Userbot {index+1} skipped an update: {error}")
@@ -1743,7 +1748,7 @@ async def start_all_userbots():
     group=0,
 )
 async def handle_bot_messages_with_links(client: Client, message: Message):
-    if not is_bot_generated_message(message):
+    if not is_bot_generated_message(message) and not is_channel_post(message):
         return
     links = extract_all_links(message)
     if not links:
@@ -1764,7 +1769,10 @@ async def handle_bot_messages_with_links(client: Client, message: Message):
             print(f"⚠️ Main bot skipped auto-join update: {error}")
 
 # --- Handle incoming group messages and replies ---
-@app.on_message(filters.group & filters.incoming, group=1)
+@app.on_message(
+    filters.incoming & (filters.bot | filters.channel),
+    group=1,
+)
 async def handle_user_replies(client: Client, message: Message):
     try:
         await forward_group_message_to_owner(message)
