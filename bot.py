@@ -7,7 +7,7 @@ import re
 import tempfile
 from contextvars import ContextVar
 from datetime import datetime, timedelta
-from pyrogram import Client, filters, utils as pyrogram_utils
+from pyrogram import Client, filters, idle, utils as pyrogram_utils
 from pyrogram.types import ReplyKeyboardMarkup, KeyboardButton, Message, InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import (
     SessionPasswordNeeded, PhoneCodeInvalid, PhoneCodeExpired, 
@@ -1593,6 +1593,21 @@ def is_channel_post(message):
     return chat_type.rsplit(".", 1)[-1] == "channel"
 
 
+def is_automated_or_channel_message(_, __, message):
+    """فلتر ضيق للبوتات ومنشورات القنوات والرسائل المرسلة باسم قناة."""
+    return bool(
+        is_bot_generated_message(message)
+        or is_channel_post(message)
+        or getattr(message, "sender_chat", None)
+    )
+
+
+AUTOMATED_OR_CHANNEL_FILTER = filters.create(
+    is_automated_or_channel_message,
+    name="automated_or_channel_message",
+)
+
+
 def get_message_context(chat_id, message_id):
     """العثور على معلومات الرسالة المرسلة أو المحفوظة من كروب."""
     for collection in ("outgoing_messages", "incoming_messages"):
@@ -1704,7 +1719,7 @@ async def start_userbot_monitor(session_str, index):
     client = Client(f"userbot_{current_profile_id()}_{index}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
 
     # لا نراقب رسائل الأعضاء العادية: بوتات داخل الكروبات أو منشورات القنوات فقط.
-    @client.on_message(filters.incoming & (filters.bot | filters.channel))
+    @client.on_message(filters.incoming & AUTOMATED_OR_CHANNEL_FILTER)
     async def userbot_message_handler(ub_client, message):
         try:
             links = extract_all_links(message)
@@ -1744,7 +1759,7 @@ async def start_all_userbots():
 
 # --- ✅ المعالج الأهم والأول: أي رسالة من بوت تحتوي روابط (يعمل إذا كان البوت الرئيسي عضواً) ---
 @app.on_message(
-    filters.incoming & (filters.group | filters.channel),
+    filters.incoming & AUTOMATED_OR_CHANNEL_FILTER,
     group=0,
 )
 async def handle_bot_messages_with_links(client: Client, message: Message):
@@ -1770,7 +1785,7 @@ async def handle_bot_messages_with_links(client: Client, message: Message):
 
 # --- Handle incoming group messages and replies ---
 @app.on_message(
-    filters.incoming & (filters.bot | filters.channel),
+    filters.incoming & AUTOMATED_OR_CHANNEL_FILTER,
     group=1,
 )
 async def handle_user_replies(client: Client, message: Message):
@@ -2677,12 +2692,11 @@ async def handle_callback(client: Client, callback_query):
             profile_context.reset(token)
 
 # --- /start command ---
-@app.on_message(group=-1)
+@app.on_message(
+    filters.private & filters.incoming & filters.command("start"),
+    group=-1,
+)
 async def start_cmd(client: Client, message: Message):
-    raw_text = (message.text or message.caption or "").strip()
-    command = raw_text.split(maxsplit=1)[0].split("@", 1)[0].lower()
-    if command != "/start":
-        return
     if not message.from_user:
         return
     if message.from_user.id != OWNER_ID:
@@ -2736,5 +2750,18 @@ if __name__ == "__main__":
     # تشغيل userbots واستئناف حلقة النشر قبل تشغيل البوت الرئيسي
     asyncio.get_event_loop().run_until_complete(startup_tasks())
 
-    # ثم تشغيل البوت الرئيسي
-    app.run()
+    # تشغيل البوت الرئيسي مع تسجيل هوية البوت المتصل بدل app.run() الصامت.
+    async def run_main_bot():
+        try:
+            await app.start()
+            me = await app.get_me()
+            print(
+                f"✅ Main bot connected: @{me.username or 'no_username'} "
+                f"(ID {me.id})"
+            )
+            await idle()
+        finally:
+            if app.is_connected:
+                await app.stop()
+
+    asyncio.get_event_loop().run_until_complete(run_main_bot())
