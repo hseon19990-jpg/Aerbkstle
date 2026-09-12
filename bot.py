@@ -7,7 +7,7 @@ import re
 import tempfile
 from contextvars import ContextVar
 from datetime import datetime, timedelta
-from pyrogram import Client, filters
+from pyrogram import Client, filters, utils as pyrogram_utils
 from pyrogram.types import ReplyKeyboardMarkup, KeyboardButton, Message, InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import (
     SessionPasswordNeeded, PhoneCodeInvalid, PhoneCodeExpired, 
@@ -19,6 +19,10 @@ except ImportError:
     # بعض إصدارات Pyrogram لا تعرض هذه الدالة بنفس المسار؛
     # لا ينبغي أن يمنع ذلك تشغيل البوت الأساسي.
     CheckChatInvite = None
+
+# Telegram channel IDs can exceed the legacy 32-bit lower bound used by
+# Pyrogram's peer classifier (for example, -1002404093511).
+pyrogram_utils.MIN_CHANNEL_ID = -10**15
 
 # --- Settings ---
 BOT_TOKEN = (os.environ.get("BOT_TOKEN") or "").strip()
@@ -472,7 +476,15 @@ async def activate_profile(index):
 
 
 # --- Bot Client ---
-app = Client("auto_post_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+# The bot-token client does not need a persistent login session. Keeping its
+# peer cache in memory also avoids reusing an outdated SQLite session.
+app = Client(
+    "auto_post_bot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN,
+    in_memory=True,
+)
 
 # --- Bot settings keyboard ---
 BOT_KEYBOARD = ReplyKeyboardMarkup(
