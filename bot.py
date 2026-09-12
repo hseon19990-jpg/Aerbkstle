@@ -25,6 +25,7 @@ BOT_TOKEN = (os.environ.get("BOT_TOKEN") or "").strip()
 OWNER_ID_RAW = (os.environ.get("OWNER_ID") or "").strip()
 API_ID_RAW = (os.environ.get("API_ID") or "").strip()
 API_HASH = (os.environ.get("API_HASH") or "").strip()
+ENABLE_USERBOT_MONITORING = (os.environ.get("ENABLE_USERBOT_MONITORING") or "").strip().lower() in {"1", "true", "yes", "on"}
 
 try:
     OWNER_ID = int(OWNER_ID_RAW)
@@ -1675,9 +1676,13 @@ async def start_userbot_monitor(session_str, index):
 
 
 async def start_all_userbots():
-    """تشغيل حسابات المراقبة الخاصة بملف التشغيل الحالي."""
+    """تشغيل حسابات المراقبة الخاصة بملف التشغيل الحالي عند تفعيلها صراحةً."""
     profile_id = current_profile_id()
     await stop_all_userbots(profile_id)
+    if not ENABLE_USERBOT_MONITORING:
+        profile_userbot_tasks[profile_id] = []
+        print("ℹ️ Userbot monitoring disabled; mandatory joins use temporary clients only")
+        return
     tasks = []
     profile_userbot_tasks[profile_id] = tasks
     for idx, session_str in enumerate(db["accounts"]):
@@ -2248,6 +2253,7 @@ async def handle_owner_commands(client: Client, message: Message):
                 except asyncio.CancelledError:
                     pass
             profile_posting_tasks[profile_id] = None
+            await stop_all_userbots(profile_id)
             await message.reply_text("🛑 تم إيقاف البوت لهذه المجموعة.")
 
         elif action == "timer":
