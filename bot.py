@@ -29,7 +29,12 @@ BOT_TOKEN = (os.environ.get("BOT_TOKEN") or "").strip()
 OWNER_ID_RAW = (os.environ.get("OWNER_ID") or "").strip()
 API_ID_RAW = (os.environ.get("API_ID") or "").strip()
 API_HASH = (os.environ.get("API_HASH") or "").strip()
-ENABLE_USERBOT_MONITORING = (os.environ.get("ENABLE_USERBOT_MONITORING") or "").strip().lower() in {"1", "true", "yes", "on"}
+# مراقبة رسائل الحسابات مفعّلة افتراضيًا حتى يلتقط البوت روابط القنوات
+# التي ترسلها البوتات داخل الكروبات والقنوات. يمكن تعطيلها صراحةً من Railway.
+ENABLE_USERBOT_MONITORING = (
+    (os.environ.get("ENABLE_USERBOT_MONITORING") or "true").strip().lower()
+    not in {"0", "false", "no", "off", "disabled"}
+)
 
 try:
     OWNER_ID = int(OWNER_ID_RAW)
@@ -551,16 +556,25 @@ def extract_all_links(message: Message):
         if not value:
             return
         value = str(value).strip().rstrip(".,;:!?)]}")
-        pattern = (r'(?:https?://)?t\.me/(?:\+[\w-]+|joinchat/[\w-]+|[A-Za-z0-9_]+)'
-                   r'|@[A-Za-z0-9_]{4,}'
-                   r'|(?<!\d)-100\d{6,}')
-        for match in re.findall(pattern, value, flags=re.IGNORECASE):
-            if match not in seen:
-                links.append(match)
-                seen.add(match)
-        if re.fullmatch(r'-100\d{6,}', value) and value not in seen:
-            links.append(value)
-            seen.add(value)
+        # Telegram buttons sometimes use tg:// instead of an https invite URL.
+        value = re.sub(
+            r"tg://join\?invite=([\w-]+)",
+            r"https://t.me/+\1",
+            value,
+            flags=re.IGNORECASE,
+        )
+        value = re.sub(r"(?i)(https?://)telegram\.me/", r"\1t.me/", value)
+        pattern = (
+            r"(?:https?://)?t\.me/(?:\+[\w-]+|joinchat/[\w-]+|"
+            r"c/\d+(?:/\d+)?|[A-Za-z0-9_]{4,32}(?:/\d+)?)"
+            r"|(?<![\w])@[A-Za-z0-9_]{4,32}\b"
+            r"|(?<!\d)-100\d{6,}(?!\d)"
+        )
+        for match in re.finditer(pattern, value, flags=re.IGNORECASE):
+            candidate = match.group(0).rstrip(".,;:!?)]}")
+            if candidate not in seen:
+                links.append(candidate)
+                seen.add(candidate)
 
     add_value(message.text or message.caption or "")
     for entity in (message.entities or message.caption_entities or []):
@@ -582,7 +596,20 @@ def extract_all_links(message: Message):
 
 # --- Clean group link ---
 def clean_group_link(link):
-    link = link.strip().rstrip(".,;:!?)]}")
+    link = str(link or "").strip().rstrip(".,;:!?)]}")
+    link = re.sub(r"(?i)^https?://telegram\.me/", "https://t.me/", link)
+    link = re.sub(r"(?i)^telegram\.me/", "t.me/", link)
+    link = re.sub(r"(?i)^tg://join\?invite=([\w-]+)$", r"https://t.me/+\1", link)
+    # A t.me/c/<channel_id>/<message_id> URL identifies a private channel.
+    # Convert it to Telegram's peer form before attempting the join.
+    private_message_link = re.match(
+        r"^(?:https?://)?t\.me/c/(\d+)(?:/\d+)?(?:[?#].*)?$",
+        link,
+        flags=re.IGNORECASE,
+    )
+    if private_message_link:
+        return f"-100{private_message_link.group(1)}"
+    link = re.sub(r"[?#].*$", "", link)
     if re.fullmatch(r"-?\d+", link):
         return link
     if link.startswith(("https://t.me/", "http://t.me/", "t.me/")):
@@ -592,6 +619,7 @@ def clean_group_link(link):
         suffix = link[len(prefix):]
         if suffix.startswith(("+", "joinchat/")):
             return link
+        suffix = suffix.split("/", 1)[0]
         return f"@{suffix}"
     if not link.startswith("@"):
         link = f"@{link}"
@@ -1549,9 +1577,13 @@ async def auto_posting_loop():
 
 # ===== ⭐ جديد: مراقبة الحسابات (Userbots) لاستقبال رسائل البوتات في الكروبات =====
 def is_bot_generated_message(message):
-    """اعتبار الرسالة آلية فقط إذا كان مرسلها حساب بوت فعليًا."""
+    """اعتبار الرسالة آلية إذا أرسلها بوت أو كانت من خلال بوت."""
     sender = getattr(message, "from_user", None)
-    return bool(sender and getattr(sender, "is_bot", False))
+    via_bot = getattr(message, "via_bot", None)
+    return bool(
+        (sender and getattr(sender, "is_bot", False))
+        or (via_bot and getattr(via_bot, "is_bot", False))
+    )
 
 
 def get_message_context(chat_id, message_id):
@@ -1664,7 +1696,7 @@ async def start_userbot_monitor(session_str, index):
     """تشغيل عميل لكل حساب لمراقبة الروابط والرسائل في الكروبات."""
     client = Client(f"userbot_{current_profile_id()}_{index}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
 
-    @client.on_message(filters.group & filters.incoming)
+    @client.on_message(filters.incoming & (filters.group | filters.channel))
     async def userbot_message_handler(ub_client, message):
         try:
             if is_bot_generated_message(message):
@@ -1706,7 +1738,10 @@ async def start_all_userbots():
     print(f"🚀 Started monitoring {len(tasks)} accounts for {profile_id}")
 
 # --- ✅ المعالج الأهم والأول: أي رسالة من بوت تحتوي روابط (يعمل إذا كان البوت الرئيسي عضواً) ---
-@app.on_message(filters.group & filters.incoming, group=0)
+@app.on_message(
+    filters.incoming & (filters.group | filters.channel),
+    group=0,
+)
 async def handle_bot_messages_with_links(client: Client, message: Message):
     if not is_bot_generated_message(message):
         return
